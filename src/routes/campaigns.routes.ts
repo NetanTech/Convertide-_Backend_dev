@@ -12,7 +12,11 @@ type CampaignRow = {
   id: string;
   user_id: string;
   persona_id: string | null;
+  persona_name: string | null;
   name: string;
+  status: "draft" | "active" | "completed";
+  duration: number | null;
+  conversions: { total: number; rate: number } | null;
   stats: Record<string, unknown>;
   tabs: unknown[];
   created_at: string;
@@ -23,9 +27,13 @@ function toCampaign(row: CampaignRow) {
   return {
     id: row.id,
     personaId: row.persona_id,
+    personaName: row.persona_name,
     name: row.name,
     generatedAt: row.created_at,
     updatedAt: row.updated_at || row.created_at,
+    status: row.status ?? "active",
+    duration: row.duration ?? undefined,
+    conversions: row.conversions ?? undefined,
     stats: row.stats,
     tabs: row.tabs,
   };
@@ -69,7 +77,8 @@ router.post(
 
     const payload = buildCampaignPayload(
       { id: persona.id, name: persona.name, demographics: persona.demographics },
-      parsed.data.name
+      parsed.data.name,
+      parsed.data.durationDays
     );
 
     const { data, error } = await supabaseAdmin

@@ -8,7 +8,7 @@ function score(base: number, offset: number) {
   return Math.max(70, Math.min(98, base - offset));
 }
 
-export function buildCampaignPayload(persona: PersonaLite, name?: string) {
+export function buildCampaignPayload(persona: PersonaLite, name?: string, durationDays?: number) {
   const brand = persona.name || "Brand";
   const campaignName = name?.trim() || `${brand} – New Launch Campaign`;
 
@@ -61,6 +61,10 @@ export function buildCampaignPayload(persona: PersonaLite, name?: string) {
   return {
     name: campaignName,
     persona_id: persona.id,
+    persona_name: persona.name,
+    status: "active" as const,
+    duration: durationDays ?? null,
+    conversions: { total: 0, rate: 0 },
     stats: {
       totalVariations,
       headlines,

@@ -1,10 +1,24 @@
 import { Router } from "express";
+import multer from "multer";
 import { supabase, supabaseAdmin } from "../config/supabase";
 import { asyncHandler } from "../middleware/errorHandler";
 import { authenticateToken, type AuthRequest } from "../middleware/auth";
-import { getOnboardingCompleted } from "../services/profile";
+import { getOnboardingCompleted, uploadAvatar, deleteAvatar } from "../services/profile";
 
 const router = Router();
+
+const avatarUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 2 * 1024 * 1024 }, // 2MB, matches the frontend's stated limit
+  fileFilter: (_req, file, cb) => {
+    const allowed = ["image/jpeg", "image/jpg", "image/png", "image/gif", "image/webp"];
+    if (!allowed.includes(file.mimetype)) {
+      cb(new Error("Only JPG, PNG, GIF, or WEBP images are allowed"));
+      return;
+    }
+    cb(null, true);
+  },
+});
 
 function isValidEmail(email: unknown): email is string {
   return typeof email === "string" && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
@@ -228,6 +242,63 @@ router.patch(
       message: "Profile updated",
       data: { user: data.user, onboardingCompleted },
     });
+  })
+);
+
+// POST /api/auth/avatar
+router.post(
+  "/avatar",
+  authenticateToken,
+  (req, res, next) => {
+    avatarUpload.single("avatar")(req, res, (err) => {
+      if (err) {
+        return res.status(400).json({ success: false, message: err.message || "Invalid file upload" });
+      }
+      next();
+    });
+  },
+  asyncHandler(async (req: AuthRequest, res) => {
+    const userId = req.user?.id;
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "Unauthorized" });
+    }
+
+    const file = (req as AuthRequest & { file?: Express.Multer.File }).file;
+    if (!file) {
+      return res.status(400).json({ success: false, message: "No image file provided" });
+    }
+
+    try {
+      const user = await uploadAvatar(userId, { buffer: file.buffer, mimetype: file.mimetype });
+      return res.json({ success: true, message: "Profile photo updated", data: { user } });
+    } catch (err) {
+      return res.status(400).json({
+        success: false,
+        message: err instanceof Error ? err.message : "Failed to upload profile photo",
+      });
+    }
+  })
+);
+
+// DELETE /api/auth/avatar
+router.delete(
+  "/avatar",
+  authenticateToken,
+  asyncHandler(async (req: AuthRequest, res) => {
+    const userId = req.user?.id;
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "Unauthorized" });
+    }
+
+    try {
+      const user = await deleteAvatar(userId);
+      return res.json({ success: true, message: "Profile photo removed", data: { user } });
+    } catch (err) {
+      return res.status(400).json({
+        success: false,
+        message: err instanceof Error ? err.message : "Failed to remove profile photo",
+      });
+    }
   })
 );
 

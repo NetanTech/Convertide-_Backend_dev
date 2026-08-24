@@ -63,6 +63,7 @@ export const updatePlanSchema = z.object({
       })
     )
     .optional(),
+  progress: z.number().min(0).max(100).optional(),
 });
 
 export type CreatePlanInput = z.infer<typeof createPlanSchema>;
