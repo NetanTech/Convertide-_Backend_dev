@@ -24,6 +24,7 @@ type PlanRow = {
   content_calendar: unknown[];
   kpis: unknown[];
   expected_outcome: unknown[];
+  progress: number | null;
   created_at: string;
   updated_at: string | null;
 };
@@ -46,6 +47,7 @@ function toPlan(row: PlanRow) {
     contentCalendar: row.content_calendar,
     kpis: row.kpis,
     expectedOutcome: row.expected_outcome,
+    progress: row.progress ?? 0,
   };
 }
 
@@ -174,6 +176,7 @@ router.patch(
     if (body.contentCalendar !== undefined) updates.content_calendar = body.contentCalendar;
     if (body.kpis !== undefined) updates.kpis = body.kpis;
     if (body.expectedOutcome !== undefined) updates.expected_outcome = body.expectedOutcome;
+    if (body.progress !== undefined) updates.progress = body.progress;
 
     const { data, error } = await supabaseAdmin
       .from("plans")

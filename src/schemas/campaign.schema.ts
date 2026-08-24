@@ -14,10 +14,19 @@ const tabSchema = z.object({
 export const createCampaignSchema = z.object({
   personaId: z.string().uuid(),
   name: z.string().min(1).optional(),
+  durationDays: z.number().int().positive().optional(),
 });
 
 export const updateCampaignSchema = z.object({
   name: z.string().min(1).optional(),
+  status: z.enum(["draft", "active", "completed"]).optional(),
+  duration: z.number().int().positive().nullable().optional(),
+  conversions: z
+    .object({
+      total: z.number(),
+      rate: z.number(),
+    })
+    .optional(),
   stats: z
     .object({
       totalVariations: z.number(),

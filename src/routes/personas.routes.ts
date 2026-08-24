@@ -257,4 +257,28 @@ router.post(
   })
 );
 
+// DELETE /api/personas/:id
+router.delete(
+  "/:id",
+  authenticateToken,
+  asyncHandler(async (req: AuthRequest, res) => {
+    const { data, error } = await supabaseAdmin
+      .from("personas")
+      .delete()
+      .eq("user_id", req.user!.id)
+      .eq("id", req.params.id)
+      .select("id")
+      .maybeSingle();
+
+    if (error) {
+      return res.status(500).json({ success: false, message: error.message });
+    }
+    if (!data) {
+      return res.status(404).json({ success: false, message: "Persona not found" });
+    }
+
+    return res.json({ success: true, message: "Persona deleted" });
+  })
+);
+
 export default router;
