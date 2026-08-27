@@ -19,6 +19,8 @@
     "helmet": "^8.1.0",
     "morgan": "^1.10.1",
     "multer": "^2.2.0",
+    "nodemailer": "^9.0.5",
+    "stripe": "^17.7.0",
     "zod": "^4.4.3"
   },
   "devDependencies": {
@@ -27,6 +29,7 @@
     "@types/morgan": "^1.9.10",
     "@types/multer": "^2.2.0",
     "@types/node": "^24.3.0",
+    "@types/nodemailer": "^8.0.1",
     "ts-node-dev": "^2.0.0",
     "typescript": "^5.9.2"
   }

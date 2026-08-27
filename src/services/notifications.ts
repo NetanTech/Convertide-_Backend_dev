@@ -1,6 +1,7 @@
 import { supabaseAdmin } from "../config/supabase";
 import type { CreateNotificationInput } from "../schemas/notification.schema";
 import { ensureUserSettings } from "./settings";
+import { sendNotificationEmail } from "./notificationEmail";
 
 type NotificationRow = {
   id: string;
@@ -81,6 +82,20 @@ export async function createNotification(userId: string, input: CreateNotificati
     .single();
 
   if (error || !data) throw new Error(error?.message || "Failed to create notification");
+
+  // Mirror to email when the user enabled Email Notification in Settings.
+  if (prefs.emailNotification) {
+    try {
+      await sendNotificationEmail(userId, input);
+    } catch (err) {
+      console.error("[notifications] email mirror failed", err);
+    }
+  } else {
+    console.info(
+      `[notifications] email skipped (emailNotification=off): "${input.title}" for user ${userId}`
+    );
+  }
+
   return toNotification(data as NotificationRow);
 }
 

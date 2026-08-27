@@ -6,6 +6,9 @@ import { onboardingInputSchema } from "../schemas/persona.schema";
 import { generatePersona } from "../services/personaGenerator";
 import { createNotification } from "../services/notifications";
 import { markOnboardingCompleted } from "../services/profile";
+import { consumeCredits, CREDIT_COSTS, InsufficientCreditsError } from "../services/billing";
+import { ensureUserSettings } from "../services/settings";
+import { maybeAutoSaveAiCopy } from "../services/autoSaveAssets";
 
 const router = Router();
 
@@ -64,7 +67,17 @@ router.post(
       });
     }
 
-    const generated = await generatePersona(parsedInput.data);
+    try {
+      await consumeCredits(req.user!.id, CREDIT_COSTS.persona, "persona_generate");
+    } catch (err) {
+      if (err instanceof InsufficientCreditsError) {
+        return res.status(402).json({ success: false, message: err.message });
+      }
+      throw err;
+    }
+
+    const aiPrefs = (await ensureUserSettings(req.user!.id)).ai;
+    const generated = await generatePersona(parsedInput.data, aiPrefs);
 
     const { data, error } = await supabaseAdmin
       .from("personas")
@@ -92,6 +105,14 @@ router.post(
 
     await markOnboardingCompleted(req.user!.id);
 
+    await maybeAutoSaveAiCopy(req.user!.id, {
+      title: `Persona — ${generated.name}`,
+      excerpt: [generated.confidenceSummary, ...generated.psychographics.slice(0, 3)].filter(Boolean).join("\n"),
+      personaId: (data as PersonaRow).id,
+      personaName: generated.name,
+      platform: "Persona",
+    });
+
     await createNotification(req.user!.id, {
       category: "ai",
       title: "New Persona",
@@ -110,17 +131,35 @@ router.get(
   "/",
   authenticateToken,
   asyncHandler(async (req: AuthRequest, res) => {
-    const { data, error } = await supabaseAdmin
+    const page = Math.max(1, parseInt(String(req.query.page ?? "1"), 10) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(String(req.query.limit ?? "20"), 10) || 20));
+    const search = typeof req.query.search === "string" ? req.query.search.trim() : "";
+    const from = (page - 1) * limit;
+    const to = from + limit - 1;
+
+    let query = supabaseAdmin
       .from("personas")
-      .select("*")
-      .eq("user_id", req.user!.id)
-      .order("created_at", { ascending: false });
+      .select("*", { count: "exact" })
+      .eq("user_id", req.user!.id);
+
+    if (search) {
+      query = query.ilike("name", `%${search}%`);
+    }
+
+    const { data, error, count } = await query.order("created_at", { ascending: false }).range(from, to);
 
     if (error) {
       return res.status(500).json({ success: false, message: error.message });
     }
 
-    return res.json({ success: true, data: { personas: (data as PersonaRow[]).map(toPersona) } });
+    const total = count ?? 0;
+    return res.json({
+      success: true,
+      data: {
+        personas: (data as PersonaRow[]).map(toPersona),
+        pagination: { page, limit, total, totalPages: Math.max(1, Math.ceil(total / limit)) },
+      },
+    });
   })
 );
 
@@ -147,6 +186,50 @@ router.get(
   })
 );
 
+// POST /api/personas/:id/duplicate
+router.post(
+  "/:id/duplicate",
+  authenticateToken,
+  asyncHandler(async (req: AuthRequest, res) => {
+    const { data: original, error: fetchError } = await supabaseAdmin
+      .from("personas")
+      .select("*")
+      .eq("user_id", req.user!.id)
+      .eq("id", req.params.id)
+      .maybeSingle();
+
+    if (fetchError) return res.status(500).json({ success: false, message: fetchError.message });
+    if (!original) return res.status(404).json({ success: false, message: "Persona not found" });
+
+    const source = original as PersonaRow;
+    const { data: created, error: insertError } = await supabaseAdmin
+      .from("personas")
+      .insert({
+        user_id: req.user!.id,
+        name: `${source.name} (Copy)`,
+        confidence: source.confidence,
+        confidence_label: source.confidence_label,
+        confidence_summary: source.confidence_summary,
+        demographics: source.demographics,
+        psychographics: source.psychographics,
+        pain_points: source.pain_points,
+        goals: source.goals,
+        buying_triggers: source.buying_triggers,
+        objections: source.objections,
+        platform_preferences: source.platform_preferences,
+        onboarding_input: source.onboarding_input ?? null,
+      })
+      .select("*")
+      .single();
+
+    if (insertError || !created) {
+      return res.status(500).json({ success: false, message: insertError?.message || "Failed to duplicate persona" });
+    }
+
+    return res.status(201).json({ success: true, data: { persona: toPersona(created as PersonaRow) } });
+  })
+);
+
 // PATCH /api/personas/:id
 router.patch(
   "/:id",
@@ -167,9 +250,7 @@ router.patch(
     }
 
     const body = req.body as Record<string, unknown>;
-    const updates: Record<string, unknown> = {
-      updated_at: new Date().toISOString(),
-    };
+    const updates: Record<string, unknown> = {};
 
     if (Array.isArray(body.demographics)) updates.demographics = body.demographics;
     if (Array.isArray(body.psychographics)) updates.psychographics = body.psychographics;
@@ -179,7 +260,7 @@ router.patch(
     if (Array.isArray(body.objections)) updates.objections = body.objections;
     if (Array.isArray(body.platformPreferences)) updates.platform_preferences = body.platformPreferences;
 
-    if (Object.keys(updates).length === 1) {
+    if (Object.keys(updates).length === 0) {
       return res.status(400).json({ success: false, message: "No editable fields provided." });
     }
 
@@ -226,7 +307,17 @@ router.post(
       });
     }
 
-    const generated = await generatePersona(parsedInput.data);
+    try {
+      await consumeCredits(req.user!.id, CREDIT_COSTS.persona, "persona_regenerate");
+    } catch (err) {
+      if (err instanceof InsufficientCreditsError) {
+        return res.status(402).json({ success: false, message: err.message });
+      }
+      throw err;
+    }
+
+    const aiPrefs = (await ensureUserSettings(req.user!.id)).ai;
+    const generated = await generatePersona(parsedInput.data, aiPrefs);
 
     const { data, error } = await supabaseAdmin
       .from("personas")
@@ -242,7 +333,6 @@ router.post(
         buying_triggers: generated.buyingTriggers,
         objections: generated.objections,
         platform_preferences: generated.platformPreferences,
-        updated_at: new Date().toISOString(),
       })
       .eq("user_id", req.user!.id)
       .eq("id", req.params.id)
@@ -252,6 +342,14 @@ router.post(
     if (error || !data) {
       return res.status(500).json({ success: false, message: error?.message || "Failed to regenerate persona" });
     }
+
+    await maybeAutoSaveAiCopy(req.user!.id, {
+      title: `Persona — ${generated.name} (regenerated)`,
+      excerpt: [generated.confidenceSummary, ...generated.psychographics.slice(0, 3)].filter(Boolean).join("\n"),
+      personaId: (data as PersonaRow).id,
+      personaName: generated.name,
+      platform: "Persona",
+    });
 
     return res.json({ success: true, data: { persona: toPersona(data as PersonaRow) } });
   })
