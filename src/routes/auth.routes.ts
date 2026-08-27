@@ -3,7 +3,24 @@ import multer from "multer";
 import { supabase, supabaseAdmin } from "../config/supabase";
 import { asyncHandler } from "../middleware/errorHandler";
 import { authenticateToken, type AuthRequest } from "../middleware/auth";
-import { getOnboardingCompleted, uploadAvatar, deleteAvatar } from "../services/profile";
+import { getOnboardingCompleted, uploadAvatar, deleteAvatar, deleteUserAccount } from "../services/profile";
+import {
+  cleanupDeviceMetaExcept,
+  listUserSessions,
+  rememberSessionDevice,
+  revokeUserSession,
+  sessionIdFromAccessToken,
+  supabaseAuthForRequest,
+} from "../services/sessions";
+import {
+  cancelTotpEnrollment,
+  checkLoginNeedsMfa,
+  disableTotp,
+  enrollTotp,
+  getMfaStatus,
+  verifyLoginTotp,
+  verifyTotpEnrollment,
+} from "../services/mfa";
 
 const router = Router();
 
@@ -26,6 +43,18 @@ function isValidEmail(email: unknown): email is string {
 
 function isValidPassword(password: unknown): password is string {
   return typeof password === "string" && password.length >= 8;
+}
+
+function readRefreshToken(req: { body?: unknown }): string {
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  const value = body.refreshToken ?? body.refresh_token;
+  return typeof value === "string" ? value : "";
+}
+
+function readMfaCode(req: { body?: unknown }): string {
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  const value = body.code;
+  return typeof value === "string" ? value.trim() : "";
 }
 
 async function sessionResponse(
@@ -96,19 +125,27 @@ router.post(
       return res.status(400).json({ success: false, message: "Email and verification code are required" });
     }
 
-    const { data, error } = await supabase.auth.verifyOtp({ email, token, type: "signup" });
+    const { data, error } = await supabaseAuthForRequest(req).auth.verifyOtp({
+      email,
+      token,
+      type: "signup",
+    });
 
     if (error || !data.session) {
       return res.status(400).json({ success: false, message: error?.message || "Invalid or expired code" });
     }
 
-            return res.json({
-              success: true,
-              message: "Email verified",
-              data: await sessionResponse(data.session, data.user),
-            });
-          })
-        );
+    if (data.user?.id) {
+      await rememberSessionDevice(data.user.id, data.session.access_token, req);
+    }
+
+    return res.json({
+      success: true,
+      message: "Email verified",
+      data: await sessionResponse(data.session, data.user),
+    });
+  })
+);
 
 // POST /api/auth/resend-verification
 router.post(
@@ -140,19 +177,33 @@ router.post(
       return res.status(400).json({ success: false, message: "Email and password are required" });
     }
 
-    const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+    const { data, error } = await supabaseAuthForRequest(req).auth.signInWithPassword({
+      email,
+      password,
+    });
 
     if (error || !data.session) {
       return res.status(401).json({ success: false, message: "Invalid email or password" });
     }
 
-            return res.json({
-              success: true,
-              message: "Logged in",
-              data: await sessionResponse(data.session, data.user),
-            });
-          })
-        );
+    if (data.user?.id) {
+      await rememberSessionDevice(data.user.id, data.session.access_token, req);
+    }
+
+    const mfa = await checkLoginNeedsMfa(data.session.access_token, data.session.refresh_token);
+    const base = await sessionResponse(data.session, data.user);
+
+    return res.json({
+      success: true,
+      message: mfa.mfaRequired ? "Authenticator code required" : "Logged in",
+      data: {
+        ...base,
+        mfaRequired: mfa.mfaRequired,
+        factorId: mfa.factorId,
+      },
+    });
+  })
+);
 
 // POST /api/auth/refresh
 router.post(
@@ -164,18 +215,24 @@ router.post(
       return res.status(400).json({ success: false, message: "refresh_token is required" });
     }
 
-    const { data, error } = await supabase.auth.refreshSession({ refresh_token: refreshToken });
+    const { data, error } = await supabaseAuthForRequest(req).auth.refreshSession({
+      refresh_token: refreshToken,
+    });
 
     if (error || !data.session) {
       return res.status(401).json({ success: false, message: "Invalid or expired refresh token" });
     }
 
-            return res.json({
-              success: true,
-              data: await sessionResponse(data.session, data.user),
-            });
-          })
-        );
+    if (data.user?.id) {
+      await rememberSessionDevice(data.user.id, data.session.access_token, req);
+    }
+
+    return res.json({
+      success: true,
+      data: await sessionResponse(data.session, data.user),
+    });
+  })
+);
 
 // POST /api/auth/logout (requires Authorization: Bearer <access_token>)
 router.post(
@@ -183,10 +240,283 @@ router.post(
   authenticateToken,
   asyncHandler(async (req: AuthRequest, res) => {
     if (req.accessToken) {
-      // Revokes the refresh token server-side so the access token can't be renewed.
-      await supabaseAdmin.auth.admin.signOut(req.accessToken, "global");
+      // "local" — revokes only this session's refresh token, leaving the
+      // user's other devices logged in. (Previously this passed "global",
+      // which silently logged the user out everywhere on every click.)
+      await supabaseAdmin.auth.admin.signOut(req.accessToken, "local");
     }
     return res.json({ success: true, message: "Logged out" });
+  })
+);
+
+// POST /api/auth/logout-all-devices (requires Authorization: Bearer <access_token>)
+router.post(
+  "/logout-all-devices",
+  authenticateToken,
+  asyncHandler(async (req: AuthRequest, res) => {
+    if (!req.accessToken) {
+      return res.status(401).json({ success: false, message: "Unauthorized" });
+    }
+    // "others" — revokes every session except the one making this request,
+    // so the current device stays logged in while everything else is kicked out.
+    const { error } = await supabaseAdmin.auth.admin.signOut(req.accessToken, "others");
+    if (error) {
+      return res.status(500).json({ success: false, message: error.message });
+    }
+
+    const keepId = sessionIdFromAccessToken(req.accessToken);
+    if (req.user?.id) {
+      await cleanupDeviceMetaExcept(req.user.id, keepId);
+    }
+
+    return res.json({ success: true, message: "Logged out of all other devices" });
+  })
+);
+
+// GET /api/auth/sessions — list active devices/sessions for the signed-in user
+router.get(
+  "/sessions",
+  authenticateToken,
+  asyncHandler(async (req: AuthRequest, res) => {
+    const userId = req.user?.id;
+    const accessToken = req.accessToken;
+    if (!userId || !accessToken) {
+      return res.status(401).json({ success: false, message: "Unauthorized" });
+    }
+
+    try {
+      // Capture this browser's UA/IP for the current session (older logins had empty UA).
+      await rememberSessionDevice(userId, accessToken, req);
+      const sessions = await listUserSessions(userId, accessToken, req);
+      return res.json({ success: true, data: { sessions } });
+    } catch (err) {
+      return res.status(500).json({
+        success: false,
+        message: err instanceof Error ? err.message : "Could not load sessions",
+      });
+    }
+  })
+);
+
+// DELETE /api/auth/sessions/:id — revoke one other session
+router.delete(
+  "/sessions/:id",
+  authenticateToken,
+  asyncHandler(async (req: AuthRequest, res) => {
+    const userId = req.user?.id;
+    const accessToken = req.accessToken;
+    const sessionId = typeof req.params.id === "string" ? req.params.id : "";
+
+    if (!userId || !accessToken) {
+      return res.status(401).json({ success: false, message: "Unauthorized" });
+    }
+    if (!sessionId) {
+      return res.status(400).json({ success: false, message: "Session id is required" });
+    }
+
+    try {
+      await revokeUserSession(userId, sessionId, accessToken);
+      return res.json({ success: true, message: "Session revoked" });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Could not revoke session";
+      const status = message.includes("can't revoke") ? 400 : message.includes("not found") ? 404 : 500;
+      return res.status(status).json({ success: false, message });
+    }
+  })
+);
+
+// GET /api/auth/mfa/status
+router.get(
+  "/mfa/status",
+  authenticateToken,
+  asyncHandler(async (req: AuthRequest, res) => {
+    if (!req.accessToken) {
+      return res.status(401).json({ success: false, message: "Unauthorized" });
+    }
+    try {
+      const status = await getMfaStatus(req.accessToken);
+      return res.json({ success: true, data: status });
+    } catch (err) {
+      return res.status(400).json({
+        success: false,
+        message: err instanceof Error ? err.message : "Could not load MFA status",
+      });
+    }
+  })
+);
+
+// POST /api/auth/mfa/enroll — start TOTP setup (returns QR + secret)
+router.post(
+  "/mfa/enroll",
+  authenticateToken,
+  asyncHandler(async (req: AuthRequest, res) => {
+    if (!req.accessToken) {
+      return res.status(401).json({ success: false, message: "Unauthorized" });
+    }
+    const refreshToken = readRefreshToken(req);
+    if (!refreshToken) {
+      return res.status(400).json({ success: false, message: "refreshToken is required" });
+    }
+
+    try {
+      const enrollment = await enrollTotp(req.accessToken, refreshToken);
+      return res.json({ success: true, data: enrollment });
+    } catch (err) {
+      return res.status(400).json({
+        success: false,
+        message: err instanceof Error ? err.message : "Could not start authenticator setup",
+      });
+    }
+  })
+);
+
+// POST /api/auth/mfa/verify-enrollment — confirm setup with a code from the app
+router.post(
+  "/mfa/verify-enrollment",
+  authenticateToken,
+  asyncHandler(async (req: AuthRequest, res) => {
+    if (!req.accessToken) {
+      return res.status(401).json({ success: false, message: "Unauthorized" });
+    }
+    const refreshToken = readRefreshToken(req);
+    const factorId = typeof (req.body as { factorId?: unknown })?.factorId === "string"
+      ? (req.body as { factorId: string }).factorId
+      : "";
+    const code = readMfaCode(req);
+
+    if (!refreshToken) {
+      return res.status(400).json({ success: false, message: "refreshToken is required" });
+    }
+    if (!factorId || !code) {
+      return res.status(400).json({ success: false, message: "factorId and code are required" });
+    }
+
+    try {
+      const tokens = await verifyTotpEnrollment(req.accessToken, refreshToken, { factorId, code });
+      return res.json({
+        success: true,
+        message: "Authenticator enabled",
+        data: { tokens },
+      });
+    } catch (err) {
+      return res.status(400).json({
+        success: false,
+        message: err instanceof Error ? err.message : "Invalid authenticator code",
+      });
+    }
+  })
+);
+
+// POST /api/auth/mfa/cancel-enrollment
+router.post(
+  "/mfa/cancel-enrollment",
+  authenticateToken,
+  asyncHandler(async (req: AuthRequest, res) => {
+    if (!req.accessToken) {
+      return res.status(401).json({ success: false, message: "Unauthorized" });
+    }
+    const refreshToken = readRefreshToken(req);
+    const factorId = typeof (req.body as { factorId?: unknown })?.factorId === "string"
+      ? (req.body as { factorId: string }).factorId
+      : "";
+
+    if (!refreshToken || !factorId) {
+      return res.status(400).json({ success: false, message: "refreshToken and factorId are required" });
+    }
+
+    try {
+      await cancelTotpEnrollment(req.accessToken, refreshToken, factorId);
+      return res.json({ success: true, message: "Authenticator setup cancelled" });
+    } catch (err) {
+      return res.status(400).json({
+        success: false,
+        message: err instanceof Error ? err.message : "Could not cancel setup",
+      });
+    }
+  })
+);
+
+// POST /api/auth/mfa/disable — requires a current authenticator code
+router.post(
+  "/mfa/disable",
+  authenticateToken,
+  asyncHandler(async (req: AuthRequest, res) => {
+    if (!req.accessToken) {
+      return res.status(401).json({ success: false, message: "Unauthorized" });
+    }
+    const refreshToken = readRefreshToken(req);
+    const factorId = typeof (req.body as { factorId?: unknown })?.factorId === "string"
+      ? (req.body as { factorId: string }).factorId
+      : "";
+    const code = readMfaCode(req);
+
+    if (!refreshToken) {
+      return res.status(400).json({ success: false, message: "refreshToken is required" });
+    }
+    if (!factorId || !code) {
+      return res.status(400).json({ success: false, message: "factorId and code are required" });
+    }
+
+    try {
+      await disableTotp(req.accessToken, refreshToken, { factorId, code });
+      return res.json({ success: true, message: "Authenticator disabled" });
+    } catch (err) {
+      return res.status(400).json({
+        success: false,
+        message: err instanceof Error ? err.message : "Could not disable authenticator",
+      });
+    }
+  })
+);
+
+// POST /api/auth/mfa/verify-login — finish sign-in after password when MFA is on
+router.post(
+  "/mfa/verify-login",
+  asyncHandler(async (req, res) => {
+    const accessToken =
+      typeof (req.body as { accessToken?: unknown })?.accessToken === "string"
+        ? (req.body as { accessToken: string }).accessToken
+        : "";
+    const refreshToken = readRefreshToken(req);
+    const factorId = typeof (req.body as { factorId?: unknown })?.factorId === "string"
+      ? (req.body as { factorId: string }).factorId
+      : "";
+    const code = readMfaCode(req);
+
+    if (!accessToken || !refreshToken) {
+      return res.status(400).json({ success: false, message: "accessToken and refreshToken are required" });
+    }
+    if (!factorId || !code) {
+      return res.status(400).json({ success: false, message: "factorId and code are required" });
+    }
+
+    try {
+      const tokens = await verifyLoginTotp(accessToken, refreshToken, { factorId, code });
+      const { data: userData, error: userError } = await supabase.auth.getUser(tokens.access_token);
+      if (userError || !userData.user) {
+        return res.status(401).json({ success: false, message: "Could not load user after MFA" });
+      }
+
+      await rememberSessionDevice(userData.user.id, tokens.access_token, req);
+
+      return res.json({
+        success: true,
+        message: "Logged in",
+        data: await sessionResponse(
+          {
+            access_token: tokens.access_token,
+            refresh_token: tokens.refresh_token,
+            expires_at: tokens.expires_at,
+          },
+          userData.user
+        ),
+      });
+    } catch (err) {
+      return res.status(400).json({
+        success: false,
+        message: err instanceof Error ? err.message : "Invalid authenticator code",
+      });
+    }
   })
 );
 
@@ -321,13 +651,18 @@ router.post(
       return res.status(400).json({ success: false, message: "Password must be at least 8 characters" });
     }
 
-    const { error: verifyError } = await supabase.auth.signInWithPassword({
+    const { data: verifyData, error: verifyError } = await supabase.auth.signInWithPassword({
       email,
       password: currentPassword,
     });
 
     if (verifyError) {
-      return res.status(401).json({ success: false, message: "Current password is incorrect" });
+      return res.status(400).json({ success: false, message: "Current password is incorrect" });
+    }
+
+    // Password check creates a throwaway session — drop it so it doesn't show as a device.
+    if (verifyData.session?.access_token) {
+      await supabaseAdmin.auth.admin.signOut(verifyData.session.access_token, "local");
     }
 
     const { error: updateError } = await supabaseAdmin.auth.admin.updateUserById(req.user!.id, {
@@ -339,6 +674,46 @@ router.post(
     }
 
     return res.json({ success: true, message: "Password updated" });
+  })
+);
+
+// DELETE /api/auth/account — permanently delete the signed-in user and cascaded data
+router.delete(
+  "/account",
+  authenticateToken,
+  asyncHandler(async (req: AuthRequest, res) => {
+    const userId = req.user?.id;
+    const email = req.user?.email;
+    const password = typeof req.body?.password === "string" ? req.body.password : "";
+
+    if (!userId || !email) {
+      return res.status(401).json({ success: false, message: "Unauthorized" });
+    }
+    if (!password) {
+      return res.status(400).json({ success: false, message: "Password is required to delete your account" });
+    }
+
+    const { data: verifyData, error: verifyError } = await supabase.auth.signInWithPassword({
+      email,
+      password,
+    });
+
+    if (verifyError) {
+      return res.status(400).json({ success: false, message: "Password is incorrect" });
+    }
+
+    if (verifyData.session?.access_token) {
+      await supabaseAdmin.auth.admin.signOut(verifyData.session.access_token, "local");
+    }
+
+    try {
+      await deleteUserAccount(userId);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Could not delete account";
+      return res.status(500).json({ success: false, message });
+    }
+
+    return res.json({ success: true, message: "Account deleted" });
   })
 );
 

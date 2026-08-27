@@ -122,3 +122,33 @@ export async function deleteAvatar(userId: string) {
 
   return updated.user;
 }
+
+const ASSETS_BUCKET = "assets";
+
+/** Best-effort remove of a user's storage folder (avatars + uploaded assets). */
+async function purgeUserStorage(userId: string) {
+  const avatarCandidates = ["jpg", "png", "gif", "webp"].map((ext) => `${userId}/avatar.${ext}`);
+  await supabaseAdmin.storage.from(AVATAR_BUCKET).remove(avatarCandidates);
+
+  const { data: assetFiles } = await supabaseAdmin.storage.from(ASSETS_BUCKET).list(userId, {
+    limit: 1000,
+  });
+  if (assetFiles?.length) {
+    await supabaseAdmin.storage
+      .from(ASSETS_BUCKET)
+      .remove(assetFiles.map((file) => `${userId}/${file.name}`));
+  }
+}
+
+/**
+ * Permanently deletes the auth user. App tables reference auth.users with
+ * ON DELETE CASCADE, so personas/campaigns/plans/etc. go with them.
+ */
+export async function deleteUserAccount(userId: string) {
+  await purgeUserStorage(userId);
+
+  const { error } = await supabaseAdmin.auth.admin.deleteUser(userId);
+  if (error) {
+    throw new Error(error.message);
+  }
+}

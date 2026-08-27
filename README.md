@@ -2,21 +2,12 @@
 
 Express + TypeScript API for ConvertTide. Uses Supabase Auth + Postgres, with Gemini for persona generation.
 
-Frontend integration is **not** wired in this pass — these endpoints are ready for a later client hookup.
+Frontend is wired to these endpoints via `NEXT_PUBLIC_API_URL`.
 
 ## Quick start
 
 1. Copy `.env.example` → `.env` and fill Supabase + Gemini keys.
-2. In Supabase **SQL Editor**, run migrations in order:
-   - `sql/001_personas.sql`
-   - `sql/002_profiles.sql`
-   - `sql/003_user_settings.sql`
-   - `sql/004_notifications.sql`
-   - `sql/005_campaigns.sql`
-   - `sql/006_plans.sql`
-   - `sql/007_assets.sql`
-   - `sql/008_billing.sql`
-   - `sql/009_personas_updated_at.sql`
+2. In Supabase **SQL Editor**, run migrations in order under `sql/` then `migrations/` (including `007_dashboard_credits_assets.sql` and `008_assets_storage_bucket.sql`).
 3. Install + run:
 
 ```bash
@@ -57,18 +48,16 @@ Envelope: `{ success, message?, data }`
 | GET | `/:id` |
 | PATCH | `/:id` |
 | POST | `/:id/regenerate` |
+| POST | `/:id/duplicate` |
+| DELETE | `/:id` |
 
-Generating a persona marks onboarding complete and creates an inbox notification.
+Generating/regenerating a persona consumes credits and creates an inbox notification.
 
 ### Settings — `/api/settings`
 | Method | Path | Body |
 |---|---|---|
 | GET | `/` | — |
 | PATCH | `/` | `{ notifications?: {...}, ai?: {...} }` |
-
-Notification keys: `personaGenerated`, `campaignGenerated`, `marketingPlanGenerated`, `aiCreditsLow`, `billingUpdates`, `emailNotification`.
-
-AI keys: `contentTone`, `contentLength`, `preferredLanguage`, `autoSaveAiResults`.
 
 ### Notifications — `/api/notifications`
 | Method | Path |
@@ -78,15 +67,14 @@ AI keys: `contentTone`, `contentLength`, `preferredLanguage`, `autoSaveAiResults
 | PATCH | `/:id/read` |
 | DELETE | `/:id` (soft dismiss) |
 
-Shapes match the notifications inbox page (`category`, `actionLabel`, `actionHref`, `actionTone`, `unread`).
-
 ### Campaigns — `/api/campaigns`
 | Method | Path |
 |---|---|
 | GET | `/` |
-| POST | `/generate` `{ personaId, name? }` |
+| POST | `/generate` `{ personaId, name?, durationDays? }` |
 | GET | `/:id` |
 | PATCH | `/:id` |
+| POST | `/:id/duplicate` |
 | DELETE | `/:id` |
 
 ### Plans — `/api/plans`
@@ -96,6 +84,7 @@ Shapes match the notifications inbox page (`category`, `actionLabel`, `actionHre
 | POST | `/generate` `{ personaId, campaignId?, name?, budget?, durationDays? }` |
 | GET | `/:id` |
 | PATCH | `/:id` |
+| POST | `/:id/duplicate` |
 | DELETE | `/:id` |
 
 ### Assets — `/api/assets`
@@ -103,17 +92,29 @@ Shapes match the notifications inbox page (`category`, `actionLabel`, `actionHre
 |---|---|
 | GET | `/` |
 | POST | `/` |
+| POST | `/upload` | multipart `file` (+ optional title/campaignName/personaName/platform) |
+| PATCH | `/:id` |
 | DELETE | `/:id` |
 
 ### Billing — `/api/billing`
 | Method | Path |
 |---|---|
-| GET | `/` | → `{ billing: { plan, credits, paymentMethod, invoices } }` |
+| GET | `/` | → `{ billing }` |
+| GET | `/plans` | subscription overview |
+| GET | `/credits-usage?year=` | monthly credit spend |
+| POST | `/change-plan` | |
+| GET/POST | `/payment-methods` | |
+| DELETE/PATCH | `/payment-methods/:id` | |
+| PATCH | `/address` | |
 
-Starter billing rows are auto-created for new users. Stripe can replace this later.
+### Dashboard — `/api/dashboard`
+| Method | Path |
+|---|---|
+| GET | `/summary?year=` | stats, credits, monthly usage, recent personas/activities |
 
 ## Notes
 
-- Campaign/plan “generate” endpoints currently use structured templates (persona-aware). Swap `src/services/generators.ts` for Gemini later if needed.
+- Persona/campaign/plan generate endpoints deduct credits (250 / 150 / 200).
+- Campaign/plan “generate” endpoints currently use structured templates (persona-aware).
 - Notification creation respects user settings preferences.
 - Do not commit `.env`.

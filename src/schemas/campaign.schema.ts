@@ -15,6 +15,7 @@ export const createCampaignSchema = z.object({
   personaId: z.string().uuid(),
   name: z.string().min(1).optional(),
   durationDays: z.number().int().positive().optional(),
+  assetIds: z.array(z.string().uuid()).max(50).optional(),
 });
 
 export const updateCampaignSchema = z.object({

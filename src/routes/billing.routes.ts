@@ -8,6 +8,7 @@ import {
   changePlan,
   deletePaymentMethod,
   ensureBillingAccount,
+  getMonthlyCreditUsage,
   getTierCatalog,
   listPaymentMethods,
   setPrimaryPaymentMethod,
@@ -21,6 +22,12 @@ import {
   changePlanSchema,
   updateBillingAddressSchema,
 } from "../schemas/billing.schema";
+import {
+  createBillingPortalSession,
+  createCreditsAddonCheckoutSession,
+  createPlanCheckoutSession,
+  isStripeConfigured,
+} from "../services/stripe";
 
 const router = Router();
 
@@ -169,6 +176,31 @@ router.post(
       return res.status(400).json({ success: false, message: "A valid planId (pro or scale) is required" });
     }
 
+    // When Stripe is configured, upgrades go through Checkout / Portal instead of a free DB flip.
+    if (isStripeConfigured()) {
+      try {
+        const email = req.user?.email;
+        if (!email) {
+          return res.status(400).json({ success: false, message: "Account email is required for checkout" });
+        }
+        const session = await createPlanCheckoutSession({
+          userId: req.user!.id,
+          email,
+          planId: parsed.data.planId,
+        });
+        return res.json({
+          success: true,
+          message: "Continue in Stripe Checkout",
+          data: { checkoutUrl: session.url },
+        });
+      } catch (err) {
+        return res.status(400).json({
+          success: false,
+          message: err instanceof Error ? err.message : "Could not start checkout",
+        });
+      }
+    }
+
     const account = await changePlan(req.user!.id, parsed.data.planId);
 
     await createNotification(req.user!.id, {
@@ -194,6 +226,99 @@ router.post(
         },
       },
     });
+  })
+);
+
+// POST /api/billing/checkout — explicit plan checkout (same as change-plan when Stripe is on)
+router.post(
+  "/checkout",
+  authenticateToken,
+  asyncHandler(async (req: AuthRequest, res) => {
+    if (!isStripeConfigured()) {
+      return res.status(503).json({
+        success: false,
+        message: "Stripe is not configured yet. Add STRIPE_SECRET_KEY and price ids to the backend .env.",
+      });
+    }
+
+    const parsed = changePlanSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ success: false, message: "A valid planId (pro or scale) is required" });
+    }
+    const email = req.user?.email;
+    if (!email) {
+      return res.status(400).json({ success: false, message: "Account email is required for checkout" });
+    }
+
+    try {
+      const session = await createPlanCheckoutSession({
+        userId: req.user!.id,
+        email,
+        planId: parsed.data.planId,
+      });
+      return res.json({ success: true, data: { url: session.url } });
+    } catch (err) {
+      return res.status(400).json({
+        success: false,
+        message: err instanceof Error ? err.message : "Could not start checkout",
+      });
+    }
+  })
+);
+
+// POST /api/billing/portal — Stripe Customer Portal (cards, invoices, cancel)
+router.post(
+  "/portal",
+  authenticateToken,
+  asyncHandler(async (req: AuthRequest, res) => {
+    if (!isStripeConfigured()) {
+      return res.status(503).json({
+        success: false,
+        message: "Stripe is not configured yet. Add STRIPE_SECRET_KEY to the backend .env.",
+      });
+    }
+    const email = req.user?.email;
+    if (!email) {
+      return res.status(400).json({ success: false, message: "Account email is required" });
+    }
+
+    try {
+      const session = await createBillingPortalSession({ userId: req.user!.id, email });
+      return res.json({ success: true, data: { url: session.url } });
+    } catch (err) {
+      return res.status(400).json({
+        success: false,
+        message: err instanceof Error ? err.message : "Could not open billing portal",
+      });
+    }
+  })
+);
+
+// POST /api/billing/credits-addon — one-time credit pack checkout
+router.post(
+  "/credits-addon",
+  authenticateToken,
+  asyncHandler(async (req: AuthRequest, res) => {
+    if (!isStripeConfigured()) {
+      return res.status(503).json({
+        success: false,
+        message: "Stripe is not configured yet.",
+      });
+    }
+    const email = req.user?.email;
+    if (!email) {
+      return res.status(400).json({ success: false, message: "Account email is required" });
+    }
+
+    try {
+      const session = await createCreditsAddonCheckoutSession({ userId: req.user!.id, email });
+      return res.json({ success: true, data: { url: session.url } });
+    } catch (err) {
+      return res.status(400).json({
+        success: false,
+        message: err instanceof Error ? err.message : "Could not start add-on checkout",
+      });
+    }
   })
 );
 
@@ -227,7 +352,8 @@ router.delete(
   "/payment-methods/:id",
   authenticateToken,
   asyncHandler(async (req: AuthRequest, res) => {
-    const ok = await deletePaymentMethod(req.user!.id, req.params.id);
+    const id = String(req.params.id);
+    const ok = await deletePaymentMethod(req.user!.id, id);
     if (!ok) return res.status(404).json({ success: false, message: "Payment method not found" });
     return res.json({ success: true, message: "Payment method removed" });
   })
@@ -238,9 +364,25 @@ router.patch(
   "/payment-methods/:id/primary",
   authenticateToken,
   asyncHandler(async (req: AuthRequest, res) => {
-    const method = await setPrimaryPaymentMethod(req.user!.id, req.params.id);
+    const id = String(req.params.id);
+    const method = await setPrimaryPaymentMethod(req.user!.id, id);
     if (!method) return res.status(404).json({ success: false, message: "Payment method not found" });
     return res.json({ success: true, data: { paymentMethod: toPaymentMethod(method) } });
+  })
+);
+
+// GET /api/billing/credits-usage?year=2026
+router.get(
+  "/credits-usage",
+  authenticateToken,
+  asyncHandler(async (req: AuthRequest, res) => {
+    const year = Math.max(
+      2020,
+      Math.min(2100, parseInt(String(req.query.year ?? new Date().getUTCFullYear()), 10) || new Date().getUTCFullYear())
+    );
+    await ensureBillingAccount(req.user!.id);
+    const months = await getMonthlyCreditUsage(req.user!.id, year);
+    return res.json({ success: true, data: { year, months } });
   })
 );
 

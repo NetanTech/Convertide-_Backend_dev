@@ -287,3 +287,100 @@ export function toPaymentMethod(row: PaymentMethodRow) {
     isPrimary: row.is_primary,
   };
 }
+
+export const CREDIT_COSTS = {
+  persona: 250,
+  campaign: 150,
+  plan: 200,
+} as const;
+
+export class InsufficientCreditsError extends Error {
+  constructor(public remaining: number, public required: number) {
+    super(`Not enough credits. Need ${required}, have ${remaining}.`);
+    this.name = "InsufficientCreditsError";
+  }
+}
+
+/** Deducts credits and records a ledger event. Throws InsufficientCreditsError if short. */
+export async function consumeCredits(
+  userId: string,
+  amount: number,
+  reason: string
+): Promise<BillingAccountRow> {
+  const account = await ensureBillingAccount(userId);
+  const remaining = Math.max(0, account.credits_total - account.credits_used);
+
+  if (amount > remaining) {
+    throw new InsufficientCreditsError(remaining, amount);
+  }
+
+  const nextUsed = account.credits_used + amount;
+  const { data, error } = await supabaseAdmin
+    .from("billing_accounts")
+    .update({
+      credits_used: nextUsed,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("user_id", userId)
+    .select("*")
+    .single();
+
+  if (error || !data) {
+    throw new Error(error?.message || "Failed to update credits");
+  }
+
+  const { error: eventError } = await supabaseAdmin.from("billing_credit_events").insert({
+    user_id: userId,
+    amount,
+    reason,
+  });
+
+  if (eventError) {
+    console.error("[billing] failed to record credit event", eventError.message);
+  }
+
+  const updated = data as BillingAccountRow;
+  const remainingAfter = Math.max(0, updated.credits_total - updated.credits_used);
+  const threshold = Math.max(1, Math.floor(updated.credits_total * 0.2));
+  // Notify once when remaining credits cross below 20%.
+  if (remaining >= threshold && remainingAfter < threshold) {
+    const { createNotification } = await import("./notifications");
+    void createNotification(userId, {
+      category: "ai",
+      title: "AI credits running low",
+      description: `You have ${remainingAfter} credits left (under 20% of your plan). Top up or upgrade to keep generating.`,
+      actionLabel: "View Billing",
+      actionHref: "/dashboard/billing",
+      actionTone: "warning",
+    }).catch((err) => {
+      console.error("[billing] credits-low notification failed", err);
+    });
+  }
+
+  return updated;
+}
+
+/** Monthly credit spend for a calendar year (Jan–Dec). Missing months are 0. */
+export async function getMonthlyCreditUsage(
+  userId: string,
+  year: number
+): Promise<number[]> {
+  const start = new Date(Date.UTC(year, 0, 1)).toISOString();
+  const end = new Date(Date.UTC(year + 1, 0, 1)).toISOString();
+
+  const { data, error } = await supabaseAdmin
+    .from("billing_credit_events")
+    .select("amount, created_at")
+    .eq("user_id", userId)
+    .gte("created_at", start)
+    .lt("created_at", end);
+
+  if (error) throw new Error(error.message);
+
+  const months = Array.from({ length: 12 }, () => 0);
+  for (const row of data ?? []) {
+    const month = new Date(row.created_at as string).getUTCMonth();
+    months[month] += Number(row.amount) || 0;
+  }
+  return months;
+}
