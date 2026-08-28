@@ -41,6 +41,23 @@ function isValidEmail(email: unknown): email is string {
   return typeof email === "string" && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
 }
 
+async function emailHasAccount(email: string): Promise<boolean | null> {
+  const normalized = email.trim().toLowerCase();
+  try {
+    let page = 1;
+    while (page <= 50) {
+      const { data, error } = await supabaseAdmin.auth.admin.listUsers({ page, perPage: 200 });
+      if (error || !data?.users) return null;
+      if (data.users.some((user) => user.email?.toLowerCase() === normalized)) return true;
+      if (data.users.length < 200) return false;
+      page += 1;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 function isValidPassword(password: unknown): password is string {
   return typeof password === "string" && password.length >= 8;
 }
@@ -183,7 +200,14 @@ router.post(
     });
 
     if (error || !data.session) {
-      return res.status(401).json({ success: false, message: "Invalid email or password" });
+      const exists = await emailHasAccount(email);
+      return res.status(401).json({
+        success: false,
+        message:
+          exists === false
+            ? "That email doesn't have an account"
+            : "Invalid email or password",
+      });
     }
 
     if (data.user?.id) {
@@ -192,6 +216,56 @@ router.post(
 
     const mfa = await checkLoginNeedsMfa(data.session.access_token, data.session.refresh_token);
     const base = await sessionResponse(data.session, data.user);
+
+    return res.json({
+      success: true,
+      message: mfa.mfaRequired ? "Authenticator code required" : "Logged in",
+      data: {
+        ...base,
+        mfaRequired: mfa.mfaRequired,
+        factorId: mfa.factorId,
+      },
+    });
+  })
+);
+
+// POST /api/auth/oauth/session — finalize Google (or other) OAuth after frontend has tokens
+router.post(
+  "/oauth/session",
+  asyncHandler(async (req, res) => {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const accessToken =
+      typeof body.access_token === "string"
+        ? body.access_token
+        : typeof body.accessToken === "string"
+          ? body.accessToken
+          : "";
+    const refreshToken =
+      typeof body.refresh_token === "string"
+        ? body.refresh_token
+        : typeof body.refreshToken === "string"
+          ? body.refreshToken
+          : "";
+
+    if (!accessToken || !refreshToken) {
+      return res.status(400).json({
+        success: false,
+        message: "access_token and refresh_token are required",
+      });
+    }
+
+    const { data: userData, error: userError } = await supabase.auth.getUser(accessToken);
+    if (userError || !userData.user) {
+      return res.status(401).json({ success: false, message: "Invalid or expired OAuth session" });
+    }
+
+    await rememberSessionDevice(userData.user.id, accessToken, req);
+
+    const mfa = await checkLoginNeedsMfa(accessToken, refreshToken);
+    const base = await sessionResponse(
+      { access_token: accessToken, refresh_token: refreshToken },
+      userData.user
+    );
 
     return res.json({
       success: true,
