@@ -32,10 +32,26 @@ export function isEmailConfigured() {
   return Boolean(zeptoApiKey());
 }
 
+function publicAppOrigin(): string {
+  const explicit = process.env.APP_PUBLIC_URL?.trim();
+  if (explicit) return explicit.replace(/\/$/, "");
+
+  const origins = (process.env.FRONTEND_URL || "http://localhost:3000")
+    .split(",")
+    .map((origin) => origin.trim())
+    .filter(Boolean);
+
+  // Prefer a real deployed origin over localhost when FRONTEND_URL lists both (common in dev).
+  const nonLocal = origins.find(
+    (origin) => !/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?(\/|$)/i.test(origin)
+  );
+  if (nonLocal) return nonLocal.replace(/\/$/, "");
+
+  return (origins[0] || "http://localhost:3000").replace(/\/$/, "");
+}
+
 export function appUrl(path = "/") {
-  // FRONTEND_URL may be a comma-separated CORS list — use the first origin for links.
-  const raw = (process.env.FRONTEND_URL || "http://localhost:3000").split(",")[0]?.trim() || "http://localhost:3000";
-  const base = raw.replace(/\/$/, "");
+  const base = publicAppOrigin();
   const normalized = path.startsWith("/") ? path : `/${path}`;
   return `${base}${normalized}`;
 }
