@@ -4,6 +4,7 @@ import { supabase, supabaseAdmin } from "../config/supabase";
 import { asyncHandler } from "../middleware/errorHandler";
 import { authenticateToken, type AuthRequest } from "../middleware/auth";
 import { getOnboardingCompleted, uploadAvatar, deleteAvatar, deleteUserAccount } from "../services/profile";
+import { validatePhoneE164, validatePhoneForCountry } from "../lib/phone";
 import {
   cleanupDeviceMetaExcept,
   listUserSessions,
@@ -616,10 +617,27 @@ router.patch(
 
     const firstName = typeof req.body?.firstName === "string" ? req.body.firstName.trim() : "";
     const lastName = typeof req.body?.lastName === "string" ? req.body.lastName.trim() : "";
-    const phone = typeof req.body?.phone === "string" ? req.body.phone.trim() : "";
+    const phoneRaw = typeof req.body?.phone === "string" ? req.body.phone.trim() : "";
+    const phoneCountryIso =
+      typeof req.body?.phoneCountryIso === "string" ? req.body.phoneCountryIso.trim() : "";
 
     if (!firstName && !lastName) {
       return res.status(400).json({ success: false, message: "Add at least a first or last name" });
+    }
+
+    let phone = "";
+    if (phoneRaw) {
+      const validation = phoneRaw.startsWith("+")
+        ? validatePhoneE164(phoneRaw)
+        : phoneCountryIso
+          ? validatePhoneForCountry(phoneCountryIso, phoneRaw)
+          : validatePhoneE164(phoneRaw);
+
+      if (validation.ok === false) {
+        return res.status(400).json({ success: false, message: validation.message });
+      }
+
+      phone = validation.e164;
     }
 
     const fullName = [firstName, lastName].filter(Boolean).join(" ");
@@ -632,6 +650,7 @@ router.patch(
         last_name: lastName,
         full_name: fullName,
         phone,
+        phone_country_iso: phone ? phoneCountryIso || existingMeta.phone_country_iso : "",
       },
     });
 
