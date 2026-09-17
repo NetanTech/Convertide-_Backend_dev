@@ -31,15 +31,26 @@ export function toNotification(row: NotificationRow) {
   };
 }
 
-export async function listNotifications(
+export async function countUnreadNotifications(userId: string) {
+  const { count, error } = await supabaseAdmin
+    .from("notifications")
+    .select("id", { count: "exact", head: true })
+    .eq("user_id", userId)
+    .eq("unread", true)
+    .is("dismissed_at", null);
+
+  if (error) throw new Error(error.message);
+  return count ?? 0;
+}
+
+function buildListQuery(
   userId: string,
   options?: { category?: string; includeDismissed?: boolean }
 ) {
   let query = supabaseAdmin
     .from("notifications")
-    .select("*")
-    .eq("user_id", userId)
-    .order("created_at", { ascending: false });
+    .select("*", { count: "exact" })
+    .eq("user_id", userId);
 
   if (!options?.includeDismissed) {
     query = query.is("dismissed_at", null);
@@ -48,9 +59,88 @@ export async function listNotifications(
     query = query.eq("category", options.category);
   }
 
-  const { data, error } = await query;
+  return query;
+}
+
+async function resolveHighlightPage(
+  userId: string,
+  highlightId: string,
+  limit: number,
+  category?: string
+) {
+  const { data: highlighted, error } = await supabaseAdmin
+    .from("notifications")
+    .select("id, category, created_at")
+    .eq("user_id", userId)
+    .eq("id", highlightId)
+    .is("dismissed_at", null)
+    .maybeSingle();
+
   if (error) throw new Error(error.message);
-  return (data as NotificationRow[]).map(toNotification);
+  if (!highlighted) return null;
+
+  let countQuery = supabaseAdmin
+    .from("notifications")
+    .select("id", { count: "exact", head: true })
+    .eq("user_id", userId)
+    .is("dismissed_at", null)
+    .gt("created_at", highlighted.created_at);
+
+  if (category && category !== "all") {
+    countQuery = countQuery.eq("category", category);
+  }
+
+  const { count, error: countError } = await countQuery;
+  if (countError) throw new Error(countError.message);
+
+  return {
+    page: Math.floor((count ?? 0) / limit) + 1,
+    category: highlighted.category as NotificationRow["category"],
+  };
+}
+
+export async function listNotifications(
+  userId: string,
+  options?: {
+    category?: string;
+    includeDismissed?: boolean;
+    page?: number;
+    limit?: number;
+    highlightId?: string;
+  }
+) {
+  const limit = Math.min(50, Math.max(1, options?.limit ?? 10));
+  let page = Math.max(1, options?.page ?? 1);
+
+  if (options?.highlightId) {
+    const resolved = await resolveHighlightPage(userId, options.highlightId, limit, options.category);
+    if (resolved) {
+      page = resolved.page;
+    }
+  }
+
+  const from = (page - 1) * limit;
+  const to = from + limit - 1;
+
+  const { data, error, count } = await buildListQuery(userId, options)
+    .order("created_at", { ascending: false })
+    .range(from, to);
+
+  if (error) throw new Error(error.message);
+
+  const total = count ?? 0;
+  const unreadCount = await countUnreadNotifications(userId);
+
+  return {
+    notifications: (data as NotificationRow[]).map(toNotification),
+    pagination: {
+      page,
+      limit,
+      total,
+      totalPages: Math.max(1, Math.ceil(total / limit)),
+    },
+    unreadCount,
+  };
 }
 
 export async function createNotification(userId: string, input: CreateNotificationInput) {

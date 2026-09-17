@@ -137,6 +137,7 @@ router.post(
 
     const aiPrefs = (await ensureUserSettings(req.user!.id)).ai;
     const payload = await buildCampaignPayload(
+      req.user!.id,
       { id: persona.id, name: persona.name, demographics: persona.demographics },
       parsed.data.name,
       parsed.data.durationDays,

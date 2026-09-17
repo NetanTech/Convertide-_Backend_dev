@@ -77,7 +77,7 @@ router.post(
     }
 
     const aiPrefs = (await ensureUserSettings(req.user!.id)).ai;
-    const generated = await generatePersona(parsedInput.data, aiPrefs);
+    const generated = await generatePersona(req.user!.id, parsedInput.data, aiPrefs);
 
     const { data, error } = await supabaseAdmin
       .from("personas")
@@ -317,7 +317,7 @@ router.post(
     }
 
     const aiPrefs = (await ensureUserSettings(req.user!.id)).ai;
-    const generated = await generatePersona(parsedInput.data, aiPrefs);
+    const generated = await generatePersona(req.user!.id, parsedInput.data, aiPrefs);
 
     const { data, error } = await supabaseAdmin
       .from("personas")

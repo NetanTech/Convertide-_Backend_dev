@@ -49,8 +49,9 @@ async function emailHasAccount(email: string): Promise<boolean | null> {
     while (page <= 50) {
       const { data, error } = await supabaseAdmin.auth.admin.listUsers({ page, perPage: 200 });
       if (error || !data?.users) return null;
-      if (data.users.some((user) => user.email?.toLowerCase() === normalized)) return true;
-      if (data.users.length < 200) return false;
+      const users = data.users as Array<{ email?: string | null }>;
+      if (users.some((user) => user.email?.toLowerCase() === normalized)) return true;
+      if (users.length < 200) return false;
       page += 1;
     }
     return null;

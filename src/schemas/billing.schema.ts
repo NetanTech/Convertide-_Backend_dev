@@ -1,9 +1,12 @@
 import { z } from "zod";
 
-export const planTierIdSchema = z.enum(["pro", "scale", "enterprise"]);
+export const planTierIdSchema = z.enum(["free", "pro", "enterprise", "scale"]);
 
 export const changePlanSchema = z.object({
-  planId: z.enum(["pro", "scale"]), // enterprise is "Talk to Sales", not self-serve
+  // `scale` accepted for backward compatibility; normalized to enterprise server-side.
+  planId: z.enum(["free", "pro", "enterprise", "scale"]),
+  /** Optional checkout processor. Nigerians may choose stripe or paystack when both are on. */
+  provider: z.enum(["stripe", "paystack"]).optional(),
 });
 
 export const addPaymentMethodSchema = z.object({

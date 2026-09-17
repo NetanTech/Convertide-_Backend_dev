@@ -24,12 +24,20 @@ router.get(
       }
     }
 
-    const notifications = await listNotifications(req.user!.id, { category: categoryParam });
-    const unreadCount = notifications.filter((item) => item.unread).length;
+    const page = Math.max(1, parseInt(String(req.query.page ?? "1"), 10) || 1);
+    const limit = Math.min(50, Math.max(1, parseInt(String(req.query.limit ?? "10"), 10) || 10));
+    const highlightId = typeof req.query.highlightId === "string" ? req.query.highlightId : undefined;
+
+    const result = await listNotifications(req.user!.id, {
+      category: categoryParam,
+      page,
+      limit,
+      highlightId,
+    });
 
     return res.json({
       success: true,
-      data: { notifications, unreadCount },
+      data: result,
     });
   })
 );

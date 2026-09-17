@@ -16,6 +16,7 @@ import dashboardRoutes from "./routes/dashboard.routes";
 import integrationsRoutes from "./routes/integrations.routes";
 import supportRoutes from "./routes/support.routes";
 import { globalErrorHandler, notFoundHandler, asyncHandler } from "./middleware/errorHandler";
+import { handlePaystackWebhook } from "./services/paystack";
 import { handleStripeWebhook } from "./services/stripe";
 
 dotenv.config();
@@ -46,15 +47,21 @@ app.use(
   })
 );
 
-// Stripe webhooks need the raw body for signature verification — mount before json().
+// Stripe / Paystack webhooks need the raw body for signature verification — mount before json().
 app.post(
   "/api/billing/webhook",
   express.raw({ type: "application/json" }),
   asyncHandler(async (req, res) => {
-    const signature = req.headers["stripe-signature"];
-    const result = await handleStripeWebhook(
-      Buffer.isBuffer(req.body) ? req.body : Buffer.from(JSON.stringify(req.body)),
-      typeof signature === "string" ? signature : undefined
+    const rawBody = Buffer.isBuffer(req.body) ? req.body : Buffer.from(JSON.stringify(req.body));
+    const stripeSignature = req.headers["stripe-signature"];
+    if (typeof stripeSignature === "string") {
+      const result = await handleStripeWebhook(rawBody, stripeSignature);
+      return res.json(result);
+    }
+    const paystackSignature = req.headers["x-paystack-signature"];
+    const result = await handlePaystackWebhook(
+      rawBody,
+      typeof paystackSignature === "string" ? paystackSignature : undefined
     );
     return res.json(result);
   })

@@ -1,4 +1,4 @@
--- Billing snapshot + invoice history (Stripe can replace this later).
+-- Billing snapshot + invoice history (Paystack / provider syncs invoices via webhook).
 create table if not exists public.billing_accounts (
   user_id uuid primary key references auth.users (id) on delete cascade,
   plan_name text not null default 'Starter Plan',
