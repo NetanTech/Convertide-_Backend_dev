@@ -1,10 +1,7 @@
-import { z } from "zod";
-import { gemini, GEMINI_MODEL } from "../config/gemini";
 import { generatedPersonaSchema, type GeneratedPersona, type OnboardingInput } from "../schemas/persona.schema";
 import type { AiPrefs } from "./settings";
 import { buildAiPreferenceInstructions } from "./aiPrefs";
-
-const responseJsonSchema = z.toJSONSchema(generatedPersonaSchema);
+import { generateStructuredForUser } from "./aiProvider";
 
 function buildPrompt(input: OnboardingInput, aiPrefs?: AiPrefs): string {
   return `You are a senior marketing strategist. Build one detailed, realistic customer persona for the
@@ -31,34 +28,14 @@ channels. Be specific and concrete (real-sounding numbers, habits, and phrases) 
 }
 
 export async function generatePersona(
+  userId: string,
   input: OnboardingInput,
   aiPrefs?: AiPrefs
 ): Promise<GeneratedPersona> {
-  const response = await gemini.models.generateContent({
-    model: GEMINI_MODEL,
-    contents: buildPrompt(input, aiPrefs),
-    config: {
-      responseMimeType: "application/json",
-      responseJsonSchema,
-    },
-  });
-
-  const text = response.text;
-  if (!text) {
-    throw new Error("Gemini returned an empty response");
-  }
-
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    throw new Error("Gemini returned invalid JSON");
-  }
-
-  const result = generatedPersonaSchema.safeParse(parsed);
-  if (!result.success) {
-    throw new Error(`Gemini response did not match the persona schema: ${result.error.message}`);
-  }
-
-  return result.data;
+  return generateStructuredForUser(
+    userId,
+    generatedPersonaSchema,
+    buildPrompt(input, aiPrefs),
+    "You are a senior marketing strategist generating one structured buyer persona.",
+  );
 }

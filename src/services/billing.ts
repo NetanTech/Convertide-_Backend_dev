@@ -1,6 +1,6 @@
 import { supabaseAdmin } from "../config/supabase";
 
-export type PlanTierId = "pro" | "scale" | "enterprise";
+export type PlanTierId = "free" | "pro" | "enterprise";
 
 export type BillingAccountRow = {
   user_id: string;
@@ -26,6 +26,11 @@ export type BillingAccountRow = {
   billing_state: string | null;
   billing_postal_code: string | null;
   billing_country: string | null;
+  /** Renewal is off; the plan stays active until `renews_on` passes. */
+  cancel_at_period_end: boolean;
+  /** Tier this account moves to once `pending_plan_starts_on` arrives. */
+  pending_plan_id: PlanTierId | null;
+  pending_plan_starts_on: string | null;
 };
 
 export type PaymentMethodRow = {
@@ -54,43 +59,147 @@ const TIER_CATALOG: Record<
     apiPriority: string;
   }
 > = {
+  free: {
+    name: "Free",
+    description: "Get started with core AI marketing tools.",
+    price: "Free",
+    cycle: "mo",
+    features: ["500 AI Credits / mo", "1 Persona", "Basic campaign copy"],
+    creditsTotal: 500,
+    seatsLimit: 1,
+    projects: "1 active",
+    apiPriority: "Standard",
+  },
   pro: {
     name: "Pro",
-    description: "Essential AI tools for growing marketing teams.",
-    price: "$149",
+    description: "For growing teams running multiple campaigns.",
+    price: "$49",
     cycle: "mo",
-    features: ["2,500 AI Credits / mo", "5 Team Seats", "Standard Support"],
-    creditsTotal: 2500,
+    features: ["5,000 AI Credits / mo", "5 Personas", "Email support"],
+    creditsTotal: 5000,
     seatsLimit: 5,
     projects: "Unlimited",
     apiPriority: "Standard",
   },
-  scale: {
-    name: "Scale",
-    description: "Advanced automation and deep analytics for high-performance agencies.",
-    price: "$499",
-    cycle: "mo",
-    features: ["10,000 AI Credits / mo", "25 Team Seats", "Priority Support"],
-    creditsTotal: 10000,
-    seatsLimit: 25,
-    projects: "Unlimited",
-    apiPriority: "High",
-  },
   enterprise: {
     name: "Enterprise",
-    description: "Custom scale, security, and white-labeling for global corporations.",
-    price: "Custom",
-    cycle: null,
-    features: ["Unlimited AI Credits", "Custom Onboarding", "SLA & Dedicated CSM"],
-    creditsTotal: null,
-    seatsLimit: null,
+    description: "More capacity and priority support for scaling teams.",
+    price: "$79",
+    cycle: "mo",
+    features: ["15,000 AI Credits / mo", "Unlimited personas", "Priority support"],
+    creditsTotal: 15000,
+    seatsLimit: 10,
     projects: "Unlimited",
-    apiPriority: "Dedicated",
+    apiPriority: "High",
   },
 };
 
 export function getTierCatalog() {
   return TIER_CATALOG;
+}
+
+/** Normalize legacy `scale` plan ids to `enterprise`. */
+export function normalizePlanId(planId: string | null | undefined): PlanTierId {
+  if (planId === "enterprise" || planId === "pro" || planId === "free") return planId;
+  if (planId === "scale") return "enterprise";
+  return "free";
+}
+
+/** True once a paid period has run out. Missing dates count as expired. */
+function periodHasEnded(renewsOn: string | null): boolean {
+  if (!renewsOn) return true;
+  const end = new Date(renewsOn).getTime();
+  if (Number.isNaN(end)) return true;
+  return end <= Date.now();
+}
+
+/**
+ * Flags whether the plan should lapse at the end of the paid period, optionally pinning
+ * the date access runs out. Tolerates the column being absent so an unmigrated DB
+ * degrades to a warning rather than a failed request.
+ */
+export async function setCancelAtPeriodEnd(
+  userId: string,
+  cancelling: boolean,
+  accessUntil?: string | null
+): Promise<void> {
+  const patch: Record<string, unknown> = {
+    cancel_at_period_end: cancelling,
+    updated_at: new Date().toISOString(),
+  };
+  if (accessUntil) patch.renews_on = accessUntil;
+
+  const { error } = await supabaseAdmin
+    .from("billing_accounts")
+    .update(patch)
+    .eq("user_id", userId);
+
+  if (error) {
+    console.warn("[billing] setCancelAtPeriodEnd:", error.message);
+  }
+}
+
+/**
+ * Records the tier this account switches to when the paid period ends. Pass a null
+ * `planId` to drop a scheduled change. Tolerates the columns being absent.
+ */
+export async function setPendingPlanChange(
+  userId: string,
+  planId: PlanTierId | null,
+  startsOn: string | null
+): Promise<void> {
+  const { error } = await supabaseAdmin
+    .from("billing_accounts")
+    .update({
+      pending_plan_id: planId,
+      pending_plan_starts_on: planId ? startsOn : null,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("user_id", userId);
+
+  if (error) {
+    console.warn("[billing] setPendingPlanChange:", error.message);
+  }
+}
+
+/** Long-form date for user-facing copy, e.g. "March 14, 2026". */
+export function formatPlanDate(iso: string | null | undefined): string | null {
+  if (!iso) return null;
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return null;
+  return date.toLocaleDateString("en-US", {
+    month: "long",
+    day: "numeric",
+    year: "numeric",
+    timeZone: "UTC",
+  });
+}
+
+/** Which processor holds this user's live subscription, if any. */
+export async function activeSubscriptionProvider(
+  userId: string
+): Promise<"stripe" | "paystack" | null> {
+  const { data, error } = await supabaseAdmin
+    .from("billing_accounts")
+    .select("stripe_subscription_id, paystack_subscription_code")
+    .eq("user_id", userId)
+    .maybeSingle();
+
+  if (error) return null;
+
+  const row = data as {
+    stripe_subscription_id?: string | null;
+    paystack_subscription_code?: string | null;
+  } | null;
+
+  if (row?.stripe_subscription_id) return "stripe";
+  if (row?.paystack_subscription_code) return "paystack";
+  return null;
+}
+
+/** True when either processor still holds a live subscription for this user. */
+export async function hasActiveProviderSubscription(userId: string): Promise<boolean> {
+  return (await activeSubscriptionProvider(userId)) !== null;
 }
 
 export async function ensureBillingAccount(userId: string): Promise<BillingAccountRow> {
@@ -101,18 +210,65 @@ export async function ensureBillingAccount(userId: string): Promise<BillingAccou
     .maybeSingle();
 
   if (error) throw new Error(error.message);
-  if (data) return data as BillingAccountRow;
+  if (data) {
+    const raw = data as BillingAccountRow & { plan_id: string };
+    const planId = normalizePlanId(raw.plan_id);
+
+    // A cancelled plan keeps working until the paid period runs out. Webhooks normally
+    // do this downgrade; checking here means a missed webhook can't grant free access.
+    if (raw.cancel_at_period_end && planId !== "free" && periodHasEnded(raw.renews_on)) {
+      const lapsed = await changePlan(userId, "free");
+      await setCancelAtPeriodEnd(userId, false);
+      await setPendingPlanChange(userId, null, null);
+      return { ...lapsed, cancel_at_period_end: false, pending_plan_id: null, pending_plan_starts_on: null };
+    }
+
+    // A scheduled downgrade lands here if the processor's event was missed.
+    if (raw.pending_plan_id && raw.pending_plan_starts_on && periodHasEnded(raw.pending_plan_starts_on)) {
+      const pending = normalizePlanId(raw.pending_plan_id);
+      const switched = await changePlan(userId, pending);
+      await setPendingPlanChange(userId, null, null);
+      return { ...switched, pending_plan_id: null, pending_plan_starts_on: null };
+    }
+
+    const tier = TIER_CATALOG[planId];
+    const needsSync =
+      raw.plan_id !== planId ||
+      raw.plan_price !== tier.price ||
+      raw.plan_name !== tier.name ||
+      raw.plan_cycle !== (tier.cycle || raw.plan_cycle);
+
+    if (needsSync) {
+      const { data: synced } = await supabaseAdmin
+        .from("billing_accounts")
+        .update({
+          plan_id: planId,
+          plan_name: tier.name,
+          plan_price: tier.price,
+          plan_cycle: tier.cycle,
+          seats_limit: tier.seatsLimit,
+          projects: tier.projects,
+          api_priority: tier.apiPriority,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("user_id", userId)
+        .select("*")
+        .maybeSingle();
+      if (synced) return { ...(synced as BillingAccountRow), plan_id: planId };
+    }
+    return { ...raw, plan_id: planId };
+  }
 
   const renewsOn = new Date();
   renewsOn.setDate(renewsOn.getDate() + 30);
-  const defaultTier = TIER_CATALOG.pro;
+  const defaultTier = TIER_CATALOG.free;
 
   const { data: created, error: insertError } = await supabaseAdmin
     .from("billing_accounts")
     .upsert(
       {
         user_id: userId,
-        plan_id: "pro",
+        plan_id: "free",
         plan_name: defaultTier.name,
         plan_price: defaultTier.price,
         plan_cycle: defaultTier.cycle,
@@ -135,13 +291,14 @@ export async function ensureBillingAccount(userId: string): Promise<BillingAccou
   return created as BillingAccountRow;
 }
 
-export async function changePlan(userId: string, planId: "pro" | "scale"): Promise<BillingAccountRow> {
-  const tier = TIER_CATALOG[planId];
+export async function changePlan(userId: string, planId: PlanTierId): Promise<BillingAccountRow> {
+  const normalized = normalizePlanId(planId);
+  const tier = TIER_CATALOG[normalized];
 
   const { data, error } = await supabaseAdmin
     .from("billing_accounts")
     .update({
-      plan_id: planId,
+      plan_id: normalized,
       plan_name: tier.name,
       plan_price: tier.price,
       plan_cycle: tier.cycle,
@@ -159,7 +316,7 @@ export async function changePlan(userId: string, planId: "pro" | "scale"): Promi
     throw new Error(error?.message || "Failed to change plan");
   }
 
-  return data as BillingAccountRow;
+  return { ...(data as BillingAccountRow), plan_id: normalized };
 }
 
 export async function updateBillingAddress(

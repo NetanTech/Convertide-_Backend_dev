@@ -5,7 +5,7 @@
 create table if not exists billing_accounts (
   user_id uuid primary key references auth.users(id) on delete cascade,
   plan_name text not null default 'Pro',
-  plan_price text not null default '$149',
+  plan_price text not null default '$49',
   plan_cycle text default 'mo',
   renews_on timestamptz,
   credits_used integer not null default 0,

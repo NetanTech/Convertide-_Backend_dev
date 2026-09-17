@@ -1,6 +1,6 @@
 import type { AiPrefs } from "./settings";
 import { itemCountForLength } from "./aiPrefs";
-import { gemini, GEMINI_MODEL } from "../config/gemini";
+import { generateTextForUser } from "./aiProvider";
 
 type PersonaLite = {
   id: string;
@@ -186,17 +186,16 @@ function logicalBank(tone: ToneKey): string[] {
   return banks[tone];
 }
 
-async function translateTexts(texts: string[], language: string): Promise<string[]> {
+async function translateTexts(userId: string, texts: string[], language: string): Promise<string[]> {
   const target = language.trim();
   if (!target || /^english$/i.test(target) || texts.length === 0) return texts;
 
   try {
-    const response = await gemini.models.generateContent({
-      model: GEMINI_MODEL,
-      contents: `Translate each string into ${target}. Keep marketing punch and meaning. Return JSON: {"items":["..."]} with the same length and order.\n\n${JSON.stringify(texts)}`,
-      config: { responseMimeType: "application/json" },
-    });
-    const raw = response.text;
+    const raw = await generateTextForUser(
+      userId,
+      `Translate each string into ${target}. Keep marketing punch and meaning. Return JSON: {"items":["..."]} with the same length and order.\n\n${JSON.stringify(texts)}`,
+      "You are a localization assistant. Return valid JSON only.",
+    );
     if (!raw) return texts;
     const parsed = JSON.parse(raw) as { items?: unknown };
     if (!Array.isArray(parsed.items) || parsed.items.length !== texts.length) return texts;
@@ -208,6 +207,7 @@ async function translateTexts(texts: string[], language: string): Promise<string
 }
 
 export async function buildCampaignPayload(
+  userId: string,
   persona: PersonaLite,
   name?: string,
   durationDays?: number,
@@ -230,7 +230,7 @@ export async function buildCampaignPayload(
 
   const language = aiPrefs?.preferredLanguage ?? "";
   if (language.trim() && !/^english$/i.test(language.trim())) {
-    const translated = await translateTexts([...headlines, ...ctas, ...emotional, ...logical], language);
+    const translated = await translateTexts(userId, [...headlines, ...ctas, ...emotional, ...logical], language);
     let cursor = 0;
     headlines = translated.slice(cursor, (cursor += headlines.length));
     ctas = translated.slice(cursor, (cursor += ctas.length));
@@ -334,6 +334,7 @@ function weekTasks(tone: ToneKey, length: string): string[] {
 }
 
 export async function buildPlanPayload(input: {
+  userId: string;
   persona: PersonaLite;
   campaign?: { id: string; name: string } | null;
   name?: string;
@@ -366,7 +367,7 @@ export async function buildPlanPayload(input: {
   const language = input.aiPrefs?.preferredLanguage ?? "";
   if (language.trim() && !/^english$/i.test(language.trim())) {
     const flat = weekly.flatMap((w) => w.tasks);
-    const translated = await translateTexts(flat, language);
+    const translated = await translateTexts(input.userId, flat, language);
     let cursor = 0;
     weekly = weekly.map((w) => {
       const next = translated.slice(cursor, cursor + w.tasks.length);
