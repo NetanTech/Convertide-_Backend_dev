@@ -32,20 +32,27 @@ export function isEmailConfigured() {
   return Boolean(zeptoApiKey());
 }
 
-function publicAppOrigin(): string {
-  const explicit = process.env.APP_PUBLIC_URL?.trim();
-  if (explicit) return explicit.replace(/\/$/, "");
+function isLocalOrigin(origin: string): boolean {
+  return /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?(\/|$)/i.test(origin);
+}
 
+function publicAppOrigin(): string {
   const origins = (process.env.FRONTEND_URL || "http://localhost:3000")
     .split(",")
     .map((origin) => origin.trim())
     .filter(Boolean);
 
   // Prefer a real deployed origin over localhost when FRONTEND_URL lists both (common in dev).
-  const nonLocal = origins.find(
-    (origin) => !/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?(\/|$)/i.test(origin)
-  );
-  if (nonLocal) return nonLocal.replace(/\/$/, "");
+  const nonLocalFrontend = origins.find((origin) => !isLocalOrigin(origin));
+
+  const explicit = process.env.APP_PUBLIC_URL?.trim().replace(/\/$/, "");
+  // OAuth callbacks often hit Render while APP_PUBLIC_URL is still localhost for local email tests.
+  // Never send users to localhost when a deployed frontend origin is configured.
+  if (explicit && !(isLocalOrigin(explicit) && nonLocalFrontend)) {
+    return explicit;
+  }
+
+  if (nonLocalFrontend) return nonLocalFrontend.replace(/\/$/, "");
 
   return (origins[0] || "http://localhost:3000").replace(/\/$/, "");
 }
