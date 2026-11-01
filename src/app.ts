@@ -19,6 +19,7 @@ import supportRoutes from "./routes/support.routes";
 import { globalErrorHandler, notFoundHandler, asyncHandler } from "./middleware/errorHandler";
 import { handlePaystackWebhook } from "./services/paystack";
 import { handleStripeWebhook } from "./services/stripe";
+import { startSubscriptionLifecycleScheduler } from "./services/subscriptionLifecycle";
 
 dotenv.config();
 
@@ -95,4 +96,5 @@ const PORT = process.env.PORT ? Number(process.env.PORT) : 4210;
 
 app.listen(PORT, () => {
   console.log(`Convertide API listening on http://localhost:${PORT}`);
+  startSubscriptionLifecycleScheduler();
 });

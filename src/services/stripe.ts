@@ -889,6 +889,18 @@ export async function handleStripeWebhook(rawBody: Buffer, signature: string | u
         status: event.type === "invoice.paid" ? "paid" : "failed",
         paidAt: invoice.status_transitions?.paid_at ?? null,
       });
+
+      if (event.type === "invoice.payment_failed") {
+        await createNotification(userId, {
+          category: "billing",
+          title: "Payment failed",
+          description:
+            "We could not charge your payment method for Convert Tide. Update billing details to keep your plan active.",
+          actionLabel: "View Billing",
+          actionHref: "/dashboard/billing",
+          actionTone: "warning",
+        });
+      }
       break;
     }
     default:

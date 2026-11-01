@@ -210,11 +210,113 @@ export function normalizePlanId(planId: string | null | undefined): PlanTierId {
 }
 
 /** True once a paid period has run out. Missing dates count as expired. */
-function periodHasEnded(renewsOn: string | null): boolean {
+export function periodHasEnded(renewsOn: string | null): boolean {
   if (!renewsOn) return true;
   const end = new Date(renewsOn).getTime();
   if (Number.isNaN(end)) return true;
   return end <= Date.now();
+}
+
+/**
+ * Whole UTC calendar days from today until `renewsOn` (negative once past).
+ * Used for 7 / 3 / 1 day renewal reminders.
+ */
+export function calendarDaysUntil(renewsOn: string | null): number | null {
+  if (!renewsOn) return null;
+  const end = new Date(renewsOn);
+  if (Number.isNaN(end.getTime())) return null;
+  const utcEnd = Date.UTC(end.getUTCFullYear(), end.getUTCMonth(), end.getUTCDate());
+  const now = new Date();
+  const utcToday = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+  return Math.round((utcEnd - utcToday) / 86_400_000);
+}
+
+/** Raw row load / create. Does not apply period transitions (safe for changePlan). */
+async function loadOrCreateBillingAccount(userId: string): Promise<BillingAccountRow> {
+  const { data, error } = await supabaseAdmin
+    .from("billing_accounts")
+    .select("*")
+    .eq("user_id", userId)
+    .maybeSingle();
+
+  if (error) throw new Error(error.message);
+  if (data) {
+    const raw = data as BillingAccountRow & { plan_id: string };
+    return { ...raw, plan_id: normalizePlanId(raw.plan_id) };
+  }
+
+  const renewsOn = new Date();
+  renewsOn.setDate(renewsOn.getDate() + 30);
+  const defaultTier = TIER_CATALOG.free;
+
+  const { data: created, error: insertError } = await supabaseAdmin
+    .from("billing_accounts")
+    .upsert(
+      {
+        user_id: userId,
+        plan_id: "free",
+        plan_name: defaultTier.name,
+        plan_price: defaultTier.price,
+        plan_cycle: defaultTier.cycle,
+        billing_cycle: "Billed monthly",
+        renews_on: renewsOn.toISOString(),
+        credits_total: defaultTier.creditsTotal,
+        seats_limit: defaultTier.seatsLimit,
+        projects: defaultTier.projects,
+        api_priority: defaultTier.apiPriority,
+      },
+      { onConflict: "user_id" }
+    )
+    .select("*")
+    .single();
+
+  if (insertError || !created) {
+    throw new Error(insertError?.message || "Failed to create billing account");
+  }
+
+  return created as BillingAccountRow;
+}
+
+async function notifySubscriptionExpired(userId: string, planName: string): Promise<void> {
+  try {
+    const { createNotification } = await import("./notifications");
+    await createNotification(userId, {
+      category: "billing",
+      title: "Subscription expired",
+      description: `Your ${planName} plan has ended. You're back on the Free plan. Upgrade anytime to restore paid credits and limits.`,
+      actionLabel: "View Billing",
+      actionHref: "/dashboard/billing",
+      actionTone: "warning",
+    });
+  } catch (err) {
+    console.error("[billing] subscription-expired notification failed", err);
+  }
+}
+
+/**
+ * Downgrade when the paid window is over and renewal did not happen:
+ * cancelled-at-period-end, or a paid plan with no live Stripe/Paystack subscription
+ * (manual grants and failed renewals with no processor).
+ */
+async function lapseExpiredPaidPlan(account: BillingAccountRow): Promise<BillingAccountRow | null> {
+  const planId = normalizePlanId(account.plan_id);
+  if (planId === "free" || !periodHasEnded(account.renews_on)) return null;
+
+  const cancelled = account.cancel_at_period_end === true;
+  const hasProvider = await hasActiveProviderSubscription(account.user_id);
+  if (!cancelled && hasProvider) return null;
+
+  const previousName = account.plan_name || TIER_CATALOG[planId].name;
+  const lapsed = await changePlan(account.user_id, "free");
+  await setCancelAtPeriodEnd(account.user_id, false);
+  await setPendingPlanChange(account.user_id, null, null);
+  await notifySubscriptionExpired(account.user_id, previousName);
+  return {
+    ...lapsed,
+    cancel_at_period_end: false,
+    pending_plan_id: null,
+    pending_plan_starts_on: null,
+  };
 }
 
 /**
@@ -307,102 +409,59 @@ export async function hasActiveProviderSubscription(userId: string): Promise<boo
 }
 
 export async function ensureBillingAccount(userId: string): Promise<BillingAccountRow> {
-  const { data, error } = await supabaseAdmin
-    .from("billing_accounts")
-    .select("*")
-    .eq("user_id", userId)
-    .maybeSingle();
+  const raw = await loadOrCreateBillingAccount(userId);
+  const planId = normalizePlanId(raw.plan_id);
 
-  if (error) throw new Error(error.message);
-  if (data) {
-    const raw = data as BillingAccountRow & { plan_id: string };
-    const planId = normalizePlanId(raw.plan_id);
+  // Webhooks normally expire plans; this catch-up means a missed event cannot leave
+  // paid access open after renews_on (cancelled renewals and orphaned manual grants).
+  const lapsed = await lapseExpiredPaidPlan({ ...raw, plan_id: planId });
+  if (lapsed) return lapsed;
 
-    // A cancelled plan keeps working until the paid period runs out. Webhooks normally
-    // do this downgrade; checking here means a missed webhook can't grant free access.
-    if (raw.cancel_at_period_end && planId !== "free" && periodHasEnded(raw.renews_on)) {
-      const lapsed = await changePlan(userId, "free");
-      await setCancelAtPeriodEnd(userId, false);
-      await setPendingPlanChange(userId, null, null);
-      return { ...lapsed, cancel_at_period_end: false, pending_plan_id: null, pending_plan_starts_on: null };
-    }
-
-    // A scheduled downgrade lands here if the processor's event was missed.
-    if (raw.pending_plan_id && raw.pending_plan_starts_on && periodHasEnded(raw.pending_plan_starts_on)) {
-      const pending = normalizePlanId(raw.pending_plan_id);
-      const switched = await changePlan(userId, pending);
-      await setPendingPlanChange(userId, null, null);
-      return { ...switched, pending_plan_id: null, pending_plan_starts_on: null };
-    }
-
-    const tier = TIER_CATALOG[planId];
-    const interval = intervalFromBillingCycle(raw.billing_cycle);
-    const pricing = getTierPricing(planId, interval);
-    const needsSync =
-      raw.plan_id !== planId ||
-      raw.plan_price !== pricing.price ||
-      raw.plan_name !== tier.name ||
-      raw.plan_cycle !== (pricing.cycle || raw.plan_cycle) ||
-      raw.billing_cycle !== pricing.billingCycle;
-
-    if (needsSync) {
-      const { data: synced } = await supabaseAdmin
-        .from("billing_accounts")
-        .update({
-          plan_id: planId,
-          plan_name: tier.name,
-          plan_price: pricing.price,
-          plan_cycle: pricing.cycle,
-          billing_cycle: pricing.billingCycle,
-          seats_limit: tier.seatsLimit,
-          projects: tier.projects,
-          api_priority: tier.apiPriority,
-          updated_at: new Date().toISOString(),
-        })
-        .eq("user_id", userId)
-        .select("*")
-        .maybeSingle();
-      if (synced) return { ...(synced as BillingAccountRow), plan_id: planId };
-    }
-    return { ...raw, plan_id: planId };
+  // A scheduled downgrade lands here if the processor's event was missed.
+  if (raw.pending_plan_id && raw.pending_plan_starts_on && periodHasEnded(raw.pending_plan_starts_on)) {
+    const pending = normalizePlanId(raw.pending_plan_id);
+    const switched = await changePlan(userId, pending);
+    await setPendingPlanChange(userId, null, null);
+    return { ...switched, pending_plan_id: null, pending_plan_starts_on: null };
   }
 
-  const renewsOn = new Date();
-  renewsOn.setDate(renewsOn.getDate() + 30);
-  const defaultTier = TIER_CATALOG.free;
+  const tier = TIER_CATALOG[planId];
+  const interval = intervalFromBillingCycle(raw.billing_cycle);
+  const pricing = getTierPricing(planId, interval);
+  const needsSync =
+    raw.plan_id !== planId ||
+    raw.plan_price !== pricing.price ||
+    raw.plan_name !== tier.name ||
+    raw.plan_cycle !== (pricing.cycle || raw.plan_cycle) ||
+    raw.billing_cycle !== pricing.billingCycle;
 
-  const { data: created, error: insertError } = await supabaseAdmin
-    .from("billing_accounts")
-    .upsert(
-      {
-        user_id: userId,
-        plan_id: "free",
-        plan_name: defaultTier.name,
-        plan_price: defaultTier.price,
-        plan_cycle: defaultTier.cycle,
-        billing_cycle: "Billed monthly",
-        renews_on: renewsOn.toISOString(),
-        credits_total: defaultTier.creditsTotal,
-        seats_limit: defaultTier.seatsLimit,
-        projects: defaultTier.projects,
-        api_priority: defaultTier.apiPriority,
-      },
-      { onConflict: "user_id" }
-    )
-    .select("*")
-    .single();
-
-  if (insertError || !created) {
-    throw new Error(insertError?.message || "Failed to create billing account");
+  if (needsSync) {
+    const { data: synced } = await supabaseAdmin
+      .from("billing_accounts")
+      .update({
+        plan_id: planId,
+        plan_name: tier.name,
+        plan_price: pricing.price,
+        plan_cycle: pricing.cycle,
+        billing_cycle: pricing.billingCycle,
+        seats_limit: tier.seatsLimit,
+        projects: tier.projects,
+        api_priority: tier.apiPriority,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("user_id", userId)
+      .select("*")
+      .maybeSingle();
+    if (synced) return { ...(synced as BillingAccountRow), plan_id: planId };
   }
-
-  return created as BillingAccountRow;
+  return { ...raw, plan_id: planId };
 }
 
 export async function changePlan(userId: string, planId: PlanTierId): Promise<BillingAccountRow> {
   const normalized = normalizePlanId(planId);
   const tier = TIER_CATALOG[normalized];
-  const current = await ensureBillingAccount(userId);
+  // Avoid ensureBillingAccount here: period-lapse calls changePlan and would recurse.
+  const current = await loadOrCreateBillingAccount(userId);
 
   // Same-plan renewal / webhook replay must not reset credit balances or seats.
   if (current.plan_id === normalized) {
