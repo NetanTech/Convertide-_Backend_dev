@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { supabaseAdmin } from "../config/supabase";
-import { authenticateToken, type AuthRequest } from "../middleware/auth";
+import { authenticateToken } from "../middleware/auth";
+import { attachBusinessContext, type BusinessAuthRequest } from "../middleware/businessContext";
 import { asyncHandler } from "../middleware/errorHandler";
 import { ensureBillingAccount, getMonthlyCreditUsage } from "../services/billing";
 
@@ -10,8 +11,10 @@ const router = Router();
 router.get(
   "/summary",
   authenticateToken,
-  asyncHandler(async (req: AuthRequest, res) => {
+  attachBusinessContext,
+  asyncHandler(async (req: BusinessAuthRequest, res) => {
     const userId = req.user!.id;
+    const businessId = req.businessId!;
     const year = Math.max(
       2020,
       Math.min(2100, parseInt(String(req.query.year ?? new Date().getUTCFullYear()), 10) || new Date().getUTCFullYear())
@@ -29,21 +32,25 @@ router.get(
       supabaseAdmin
         .from("personas")
         .select("id", { count: "exact", head: true })
-        .eq("user_id", userId),
+        .eq("user_id", userId)
+        .eq("business_id", businessId),
       supabaseAdmin
         .from("campaigns")
         .select("id", { count: "exact", head: true })
         .eq("user_id", userId)
+        .eq("business_id", businessId)
         .eq("status", "active"),
       supabaseAdmin
         .from("plans")
         .select("id", { count: "exact", head: true })
         .eq("user_id", userId)
+        .eq("business_id", businessId)
         .eq("status", "Active"),
       supabaseAdmin
         .from("personas")
         .select("id, name, created_at")
         .eq("user_id", userId)
+        .eq("business_id", businessId)
         .order("created_at", { ascending: false })
         .limit(4),
       supabaseAdmin
@@ -54,7 +61,7 @@ router.get(
         .order("created_at", { ascending: false })
         .limit(12),
       ensureBillingAccount(userId),
-      getMonthlyCreditUsage(userId, year),
+      getMonthlyCreditUsage(userId, year, businessId),
     ]);
 
     if (personasCountRes.error) {
@@ -98,8 +105,12 @@ router.get(
           activePlans: plansActiveRes.count ?? 0,
         },
         credits: {
-          used: account.credits_used,
-          total: account.credits_total,
+          // Business-scoped usage; plan total still comes from the billing account.
+          used: req.business?.creditsUsed ?? account.credits_used,
+          total: req.business?.creditsTotal ?? account.credits_total,
+          accountUsed: account.credits_used,
+          accountTotal: account.credits_total,
+          businessId: businessId,
         },
         creditsUsage: {
           year,

@@ -184,17 +184,31 @@ export function buildAuthorizeUrl(userId: string, provider: IntegrationProvider)
 
   if (provider === "facebook" || provider === "instagram") {
     const appId = process.env.META_APP_ID!.trim();
-    const scopes =
+    // Newer Meta apps (Unified Login / Facebook Login for Business) require a configuration ID
+    // instead of (or preferred over) raw scope lists. Create configs in App Dashboard → Use cases.
+    const configId =
       provider === "instagram"
-        ? "pages_show_list,pages_read_engagement,instagram_basic,instagram_content_publish,business_management"
-        : "pages_show_list,pages_manage_posts,pages_read_engagement,business_management";
+        ? process.env.META_INSTAGRAM_CONFIG_ID?.trim() || process.env.META_FACEBOOK_CONFIG_ID?.trim()
+        : process.env.META_FACEBOOK_CONFIG_ID?.trim() || process.env.META_INSTAGRAM_CONFIG_ID?.trim();
+
     const params = new URLSearchParams({
       client_id: appId,
       redirect_uri: callbackUrl(provider),
       state,
       response_type: "code",
-      scope: scopes,
     });
+
+    if (configId) {
+      params.set("config_id", configId);
+    } else {
+      // Fallback for older apps that still authorize via scopes.
+      const scopes =
+        provider === "instagram"
+          ? "pages_show_list,pages_read_engagement,pages_manage_metadata,instagram_basic,instagram_content_publish,business_management"
+          : "pages_show_list,pages_read_engagement,pages_manage_metadata,pages_manage_posts,business_management";
+      params.set("scope", scopes);
+    }
+
     return `https://www.facebook.com/v21.0/dialog/oauth?${params}`;
   }
 
@@ -266,10 +280,33 @@ export async function handleOAuthCallback(provider: IntegrationProvider, code: s
   return { userId, provider };
 }
 
+type MetaPageAccount = {
+  id?: string;
+  name?: string;
+  access_token?: string;
+  tasks?: string[];
+  instagram_business_account?: { id?: string; username?: string };
+};
+
+/** Page + optional IG Pro ids stored on facebook/instagram integrations for live publish. */
+export type MetaPublishMetadata = {
+  platform: "meta";
+  userId?: string;
+  pageId: string;
+  pageName: string;
+  igUserId?: string;
+  igUsername?: string;
+};
+
+const META_GRAPH = "https://graph.facebook.com/v21.0";
+
 async function exchangeMetaCode(userId: string, provider: IntegrationProvider, code: string) {
-  const tokenUrl = new URL("https://graph.facebook.com/v21.0/oauth/access_token");
-  tokenUrl.searchParams.set("client_id", process.env.META_APP_ID!.trim());
-  tokenUrl.searchParams.set("client_secret", process.env.META_APP_SECRET!.trim());
+  const appId = process.env.META_APP_ID!.trim();
+  const appSecret = process.env.META_APP_SECRET!.trim();
+
+  const tokenUrl = new URL(`${META_GRAPH}/oauth/access_token`);
+  tokenUrl.searchParams.set("client_id", appId);
+  tokenUrl.searchParams.set("client_secret", appSecret);
   tokenUrl.searchParams.set("redirect_uri", callbackUrl(provider));
   tokenUrl.searchParams.set("code", code);
 
@@ -283,22 +320,109 @@ async function exchangeMetaCode(userId: string, provider: IntegrationProvider, c
     throw new Error(tokenJson.error?.message || "Meta token exchange failed");
   }
 
+  // Long-lived user token (~60 days). Page tokens derived from it stay long-lived.
+  let userToken = tokenJson.access_token;
+  let expiresIn = tokenJson.expires_in;
+  try {
+    const llUrl = new URL(`${META_GRAPH}/oauth/access_token`);
+    llUrl.searchParams.set("grant_type", "fb_exchange_token");
+    llUrl.searchParams.set("client_id", appId);
+    llUrl.searchParams.set("client_secret", appSecret);
+    llUrl.searchParams.set("fb_exchange_token", tokenJson.access_token);
+    const llRes = await fetch(llUrl);
+    const llJson = (await llRes.json()) as { access_token?: string; expires_in?: number };
+    if (llRes.ok && llJson.access_token) {
+      userToken = llJson.access_token;
+      expiresIn = llJson.expires_in ?? expiresIn;
+    }
+  } catch {
+    // Keep short-lived token if exchange fails.
+  }
+
   const meRes = await fetch(
-    `https://graph.facebook.com/v21.0/me?fields=id,name&access_token=${encodeURIComponent(tokenJson.access_token)}`
+    `${META_GRAPH}/me?fields=id,name&access_token=${encodeURIComponent(userToken)}`
   );
   const me = (await meRes.json()) as { id?: string; name?: string };
-  const accountName = me.name || (provider === "instagram" ? "Instagram account" : "Facebook account");
 
+  const pagesRes = await fetch(
+    `${META_GRAPH}/me/accounts?fields=id,name,access_token,tasks,instagram_business_account{id,username}&access_token=${encodeURIComponent(userToken)}`
+  );
+  const pagesJson = (await pagesRes.json()) as {
+    data?: MetaPageAccount[];
+    error?: { message?: string };
+  };
+  if (!pagesRes.ok) {
+    throw new Error(
+      pagesJson.error?.message ||
+        "Could not list Facebook Pages. Grant Page access during Connect and try again."
+    );
+  }
+
+  const pages = pagesJson.data ?? [];
+  const withContent = pages.filter((p) =>
+    Array.isArray(p.tasks) ? p.tasks.includes("CREATE_CONTENT") || p.tasks.length === 0 : true
+  );
+  const ranked = (withContent.length ? withContent : pages).filter((p) => p.id && p.access_token);
+
+  if (provider === "facebook") {
+    const page = ranked[0];
+    if (!page?.id || !page.access_token) {
+      throw new Error(
+        "No Facebook Page was shared. Create or select a Page during Connect, then try again."
+      );
+    }
+    const ig = page.instagram_business_account;
+    const metadata: MetaPublishMetadata = {
+      platform: "meta",
+      userId: me.id,
+      pageId: page.id,
+      pageName: page.name || "Facebook Page",
+      ...(ig?.id
+        ? { igUserId: ig.id, igUsername: ig.username || undefined }
+        : {}),
+    };
+    await upsertConnectedIntegration({
+      userId,
+      provider: "facebook",
+      accountName: page.name || "Facebook Page",
+      accountId: page.id,
+      accessToken: page.access_token,
+      tokenExpiresAt: expiresIn
+        ? new Date(Date.now() + expiresIn * 1000).toISOString()
+        : null,
+      scopes: ["pages_manage_posts", "pages_show_list"],
+      metadata,
+    });
+    return;
+  }
+
+  // Instagram: need a Professional account linked to a Page the user granted.
+  const withIg = ranked.find((p) => p.instagram_business_account?.id);
+  if (!withIg?.id || !withIg.access_token || !withIg.instagram_business_account?.id) {
+    throw new Error(
+      "No Instagram Professional account was shared. Switch Instagram to Business or Creator, link it to a Facebook Page, then Connect again. Personal Instagram cannot be used."
+    );
+  }
+  const ig = withIg.instagram_business_account;
+  const metadata: MetaPublishMetadata = {
+    platform: "meta",
+    userId: me.id,
+    pageId: withIg.id,
+    pageName: withIg.name || "Facebook Page",
+    igUserId: ig.id!,
+    igUsername: ig.username || undefined,
+  };
   await upsertConnectedIntegration({
     userId,
-    provider,
-    accountName,
-    accountId: me.id || "",
-    accessToken: tokenJson.access_token,
-    tokenExpiresAt: tokenJson.expires_in
-      ? new Date(Date.now() + tokenJson.expires_in * 1000).toISOString()
+    provider: "instagram",
+    accountName: ig.username ? `@${ig.username}` : "Instagram Professional",
+    accountId: ig.id!,
+    accessToken: withIg.access_token,
+    tokenExpiresAt: expiresIn
+      ? new Date(Date.now() + expiresIn * 1000).toISOString()
       : null,
-    metadata: { platform: "meta" },
+    scopes: ["instagram_basic", "instagram_content_publish"],
+    metadata,
   });
 }
 

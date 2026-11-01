@@ -1,16 +1,30 @@
 import { z } from "zod";
+import { industryRequiredFieldsMessage, SUPPORTED_INDUSTRIES } from "../lib/personaIndustries";
 
-export const onboardingInputSchema = z.object({
-  businessName: z.string().min(1),
-  industry: z.string().min(1),
-  offerings: z.string().min(1),
-  targetCustomers: z.array(z.string()).min(1),
-  priceRange: z.string().min(1),
-  marketingGoals: z.array(z.string()).min(1),
-  challenges: z.array(z.string()).min(1),
-});
+export const onboardingInputSchema = z
+  .object({
+    businessName: z.string().min(1),
+    industry: z.string().min(1),
+    offerings: z.string().min(1),
+    targetCustomers: z.array(z.string()).min(1),
+    priceRange: z.string().min(1),
+    marketingGoals: z.array(z.string()).min(1),
+    challenges: z.array(z.string()).min(1),
+  })
+  .superRefine((data, ctx) => {
+    const message = industryRequiredFieldsMessage(data);
+    if (message) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message,
+        path: ["industry"],
+      });
+    }
+  });
 
 export type OnboardingInput = z.infer<typeof onboardingInputSchema>;
+
+export { SUPPORTED_INDUSTRIES };
 
 // Shape the AI must return. Mirrors the frontend `Persona` type (minus id/generatedAt,
 // which the server assigns) so the response can be stored and rendered as-is.

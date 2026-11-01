@@ -16,13 +16,19 @@ export const aiPrefsSchema = z.object({
   autoSaveAiResults: z.boolean(),
 });
 
+export const securityPrefsSchema = z.object({
+  /** Idle logout after this many minutes (5–120). */
+  sessionTimeoutMinutes: z.number().int().min(5).max(120),
+});
+
 export const settingsUpdateSchema = z
   .object({
     notifications: notificationPrefsSchema.partial().optional(),
     ai: aiPrefsSchema.partial().optional(),
+    security: securityPrefsSchema.partial().optional(),
   })
-  .refine((value) => Boolean(value.notifications || value.ai), {
-    message: "Provide notifications and/or ai preferences to update",
+  .refine((value) => Boolean(value.notifications || value.ai || value.security), {
+    message: "Provide notifications, ai, and/or security preferences to update",
   });
 
 export type SettingsUpdateInput = z.infer<typeof settingsUpdateSchema>;

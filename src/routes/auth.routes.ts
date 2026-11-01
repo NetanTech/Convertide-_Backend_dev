@@ -22,6 +22,7 @@ import {
   verifyLoginTotp,
   verifyTotpEnrollment,
 } from "../services/mfa";
+import { logAccountAudit } from "../services/accountAudit";
 
 const router = Router();
 
@@ -343,6 +344,12 @@ router.post(
     const keepId = sessionIdFromAccessToken(req.accessToken);
     if (req.user?.id) {
       await cleanupDeviceMetaExcept(req.user.id, keepId);
+      await logAccountAudit({
+        userId: req.user.id,
+        action: "sessions_revoked_others",
+        actor: "user",
+        metadata: { keepSessionId: keepId },
+      });
     }
 
     return res.json({ success: true, message: "Logged out of all other devices" });
@@ -392,10 +399,23 @@ router.delete(
 
     try {
       await revokeUserSession(userId, sessionId, accessToken);
+      await logAccountAudit({
+        userId,
+        action: "session_revoked",
+        actor: "user",
+        reference: sessionId,
+      });
       return res.json({ success: true, message: "Session revoked" });
     } catch (err) {
       const message = err instanceof Error ? err.message : "Could not revoke session";
       const status = message.includes("can't revoke") ? 400 : message.includes("not found") ? 404 : 500;
+      await logAccountAudit({
+        userId,
+        action: "session_revoke_denied",
+        actor: "user",
+        reference: sessionId,
+        metadata: { reason: message, status },
+      });
       return res.status(status).json({ success: false, message });
     }
   })
@@ -436,8 +456,22 @@ router.post(
 
     try {
       const enrollment = await enrollTotp(req.accessToken, refreshToken);
+      await logAccountAudit({
+        userId: req.user!.id,
+        action: "mfa_enroll_started",
+        actor: "user",
+        reference: enrollment.factorId,
+      });
       return res.json({ success: true, data: enrollment });
     } catch (err) {
+      await logAccountAudit({
+        userId: req.user!.id,
+        action: "mfa_enroll_failed",
+        actor: "user",
+        metadata: {
+          reason: err instanceof Error ? err.message : "Could not start authenticator setup",
+        },
+      });
       return res.status(400).json({
         success: false,
         message: err instanceof Error ? err.message : "Could not start authenticator setup",
@@ -469,12 +503,28 @@ router.post(
 
     try {
       const tokens = await verifyTotpEnrollment(req.accessToken, refreshToken, { factorId, code });
+      await logAccountAudit({
+        userId: req.user!.id,
+        action: "mfa_enrolled",
+        actor: "user",
+        reference: factorId,
+      });
       return res.json({
         success: true,
         message: "Authenticator enabled",
         data: { tokens },
       });
     } catch (err) {
+      await logAccountAudit({
+        userId: req.user!.id,
+        action: "mfa_challenge_denied",
+        actor: "user",
+        reference: factorId,
+        metadata: {
+          context: "enrollment",
+          reason: err instanceof Error ? err.message : "Invalid authenticator code",
+        },
+      });
       return res.status(400).json({
         success: false,
         message: err instanceof Error ? err.message : "Invalid authenticator code",
@@ -502,6 +552,12 @@ router.post(
 
     try {
       await cancelTotpEnrollment(req.accessToken, refreshToken, factorId);
+      await logAccountAudit({
+        userId: req.user!.id,
+        action: "mfa_enroll_cancelled",
+        actor: "user",
+        reference: factorId,
+      });
       return res.json({ success: true, message: "Authenticator setup cancelled" });
     } catch (err) {
       return res.status(400).json({
@@ -535,8 +591,23 @@ router.post(
 
     try {
       await disableTotp(req.accessToken, refreshToken, { factorId, code });
+      await logAccountAudit({
+        userId: req.user!.id,
+        action: "mfa_disabled",
+        actor: "user",
+        reference: factorId,
+      });
       return res.json({ success: true, message: "Authenticator disabled" });
     } catch (err) {
+      await logAccountAudit({
+        userId: req.user!.id,
+        action: "mfa_disable_denied",
+        actor: "user",
+        reference: factorId,
+        metadata: {
+          reason: err instanceof Error ? err.message : "Could not disable authenticator",
+        },
+      });
       return res.status(400).json({
         success: false,
         message: err instanceof Error ? err.message : "Could not disable authenticator",
@@ -574,6 +645,13 @@ router.post(
       }
 
       await rememberSessionDevice(userData.user.id, tokens.access_token, req);
+      await logAccountAudit({
+        userId: userData.user.id,
+        action: "mfa_challenge_passed",
+        actor: "user",
+        reference: factorId,
+        metadata: { context: "login" },
+      });
 
       return res.json({
         success: true,
@@ -588,6 +666,24 @@ router.post(
         ),
       });
     } catch (err) {
+      // Best-effort: resolve user from the pre-MFA access token for the audit row.
+      let userId: string | null = null;
+      try {
+        const { data } = await supabase.auth.getUser(accessToken);
+        userId = data.user?.id ?? null;
+      } catch {
+        // ignore
+      }
+      await logAccountAudit({
+        userId,
+        action: "mfa_challenge_denied",
+        actor: "user",
+        reference: factorId,
+        metadata: {
+          context: "login",
+          reason: err instanceof Error ? err.message : "Invalid authenticator code",
+        },
+      });
       return res.status(400).json({
         success: false,
         message: err instanceof Error ? err.message : "Invalid authenticator code",
@@ -751,6 +847,12 @@ router.post(
     });
 
     if (verifyError) {
+      await logAccountAudit({
+        userId: req.user!.id,
+        action: "password_change_denied",
+        actor: "user",
+        metadata: { reason: "current_password_incorrect" },
+      });
       return res.status(400).json({ success: false, message: "Current password is incorrect" });
     }
 
@@ -764,8 +866,20 @@ router.post(
     });
 
     if (updateError) {
+      await logAccountAudit({
+        userId: req.user!.id,
+        action: "password_change_failed",
+        actor: "user",
+        metadata: { reason: updateError.message },
+      });
       return res.status(400).json({ success: false, message: updateError.message });
     }
+
+    await logAccountAudit({
+      userId: req.user!.id,
+      action: "password_changed",
+      actor: "user",
+    });
 
     return res.json({ success: true, message: "Password updated" });
   })

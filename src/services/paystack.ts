@@ -1,13 +1,16 @@
 import crypto from "crypto";
 import { supabaseAdmin } from "../config/supabase";
 import {
+  applyBillingIntervalDisplay,
   changePlan,
   ensureBillingAccount,
   formatPlanDate,
   getTierCatalog,
   hasActiveProviderSubscription,
+  normalizeBillingInterval,
   setCancelAtPeriodEnd,
   setPendingPlanChange,
+  type BillingInterval,
   type PlanTierId,
 } from "./billing";
 import { createNotification } from "./notifications";
@@ -40,7 +43,27 @@ function secretKey() {
   return key;
 }
 
-function planCodeForTier(planId: "pro" | "enterprise"): string {
+function planCodeForTier(
+  planId: "pro" | "enterprise",
+  interval: BillingInterval = "monthly"
+): string {
+  if (interval === "yearly") {
+    const yearlyMap = {
+      pro: process.env.PAYSTACK_PLAN_PRO_YEARLY?.trim() || "",
+      enterprise:
+        process.env.PAYSTACK_PLAN_ENTERPRISE_YEARLY?.trim() ||
+        process.env.PAYSTACK_PLAN_SCALE_YEARLY?.trim() ||
+        "",
+    };
+    const yearly = yearlyMap[planId];
+    if (!yearly) {
+      throw new Error(
+        `Missing Paystack yearly plan for ${planId}. Set PAYSTACK_PLAN_${planId === "pro" ? "PRO" : "ENTERPRISE"}_YEARLY (annual = 10× monthly / 2 months free).`
+      );
+    }
+    return yearly;
+  }
+
   const map = {
     pro: process.env.PAYSTACK_PLAN_PRO?.trim() || "",
     enterprise:
@@ -57,14 +80,33 @@ function planCodeForTier(planId: "pro" | "enterprise"): string {
 
 function planIdFromPlanCode(planCode: string | null | undefined): "pro" | "enterprise" | null {
   if (!planCode) return null;
-  if (planCode === process.env.PAYSTACK_PLAN_PRO?.trim()) return "pro";
+  if (
+    planCode === process.env.PAYSTACK_PLAN_PRO?.trim() ||
+    planCode === process.env.PAYSTACK_PLAN_PRO_YEARLY?.trim()
+  ) {
+    return "pro";
+  }
   if (
     planCode === process.env.PAYSTACK_PLAN_ENTERPRISE?.trim() ||
-    planCode === process.env.PAYSTACK_PLAN_SCALE?.trim()
+    planCode === process.env.PAYSTACK_PLAN_SCALE?.trim() ||
+    planCode === process.env.PAYSTACK_PLAN_ENTERPRISE_YEARLY?.trim() ||
+    planCode === process.env.PAYSTACK_PLAN_SCALE_YEARLY?.trim()
   ) {
     return "enterprise";
   }
   return null;
+}
+
+function intervalFromPlanCode(planCode: string | null | undefined): BillingInterval {
+  if (!planCode) return "monthly";
+  if (
+    planCode === process.env.PAYSTACK_PLAN_PRO_YEARLY?.trim() ||
+    planCode === process.env.PAYSTACK_PLAN_ENTERPRISE_YEARLY?.trim() ||
+    planCode === process.env.PAYSTACK_PLAN_SCALE_YEARLY?.trim()
+  ) {
+    return "yearly";
+  }
+  return "monthly";
 }
 
 function creditsAddonAmountKobo(): number {
@@ -221,8 +263,10 @@ export async function createPlanCheckoutSession(input: {
   userId: string;
   email: string;
   planId: "pro" | "enterprise";
+  interval?: BillingInterval;
 }): Promise<{ url: string }> {
-  const planCode = planCodeForTier(input.planId);
+  const interval = normalizeBillingInterval(input.interval);
+  const planCode = planCodeForTier(input.planId, interval);
 
   const plan = await paystackRequest<{ amount: number; currency?: string; plan_code: string }>(
     `/plan/${encodeURIComponent(planCode)}`
@@ -241,6 +285,7 @@ export async function createPlanCheckoutSession(input: {
         metadata: {
           userId: input.userId,
           planId: input.planId,
+          interval,
           purpose: "plan",
           cancel_action: appUrl("/dashboard/billing/plans?checkout=cancel"),
         },
@@ -318,10 +363,16 @@ async function adoptSubscription(
   }
 }
 
-async function applyPaidPlan(userId: string, planId: "pro" | "enterprise", renewsOn: string | null) {
+async function applyPaidPlan(
+  userId: string,
+  planId: "pro" | "enterprise",
+  renewsOn: string | null,
+  interval: BillingInterval = "monthly"
+) {
   const before = await ensureBillingAccount(userId);
 
   await changePlan(userId, planId);
+  await applyBillingIntervalDisplay(userId, planId, interval);
   await setCancelAtPeriodEnd(userId, false);
   await setPendingPlanChange(userId, null, null);
   if (renewsOn) {
@@ -329,43 +380,71 @@ async function applyPaidPlan(userId: string, planId: "pro" | "enterprise", renew
   }
   await cancelOtherProviderSubscription(userId, "paystack");
 
-  // Charges recur, so only announce a plan that actually moved.
-  if (before.plan_id === planId) return;
+  const beforeInterval = /year/i.test(before.billing_cycle) ? "yearly" : "monthly";
+  if (before.plan_id === planId && beforeInterval === interval) return;
 
   const tierName = getTierCatalog()[planId as PlanTierId]?.name ?? "your plan";
   const renewsLabel = formatPlanDate(renewsOn);
+  const intervalLabel = interval === "yearly" ? " (billed yearly — 2 months free)" : "";
   await createNotification(userId, {
     category: "billing",
     title: "Subscription updated",
     description: renewsLabel
-      ? `Your Convert Tide plan is now ${tierName}, effective immediately. Next charge ${renewsLabel}.`
-      : `Your Convert Tide plan is now ${tierName}, effective immediately.`,
+      ? `Your Convert Tide plan is now ${tierName}${intervalLabel}, effective immediately. Next charge ${renewsLabel}.`
+      : `Your Convert Tide plan is now ${tierName}${intervalLabel}, effective immediately.`,
     actionLabel: "View Billing",
     actionHref: "/dashboard/billing",
     actionTone: "primary",
   });
 }
 
-async function grantCreditsAddon(userId: string, amount = 1000) {
-  const account = await ensureBillingAccount(userId);
-  const { error } = await supabaseAdmin
-    .from("billing_accounts")
-    .update({
-      credits_total: account.credits_total + amount,
-      updated_at: new Date().toISOString(),
-    })
-    .eq("user_id", userId);
+async function grantCreditsAddon(userId: string, fulfillmentKey: string, amount = 1000) {
+  const {
+    claimFulfillment,
+    completeFulfillment,
+    releaseFulfillment,
+    logBillingAudit,
+  } = await import("./billingSafety");
 
-  if (error) throw new Error(error.message);
+  const claimed = await claimFulfillment(fulfillmentKey, "credits_addon", userId, { amount });
+  if (!claimed) return;
 
-  await createNotification(userId, {
-    category: "billing",
-    title: "Credits added",
-    description: `${amount.toLocaleString()} AI credits were added to your account.`,
-    actionLabel: "View Billing",
-    actionHref: "/dashboard/billing",
-    actionTone: "primary",
-  });
+  try {
+    const account = await ensureBillingAccount(userId);
+    const { error } = await supabaseAdmin
+      .from("billing_accounts")
+      .update({
+        credits_total: account.credits_total + amount,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("user_id", userId);
+
+    if (error) throw new Error(error.message);
+
+    await completeFulfillment(fulfillmentKey);
+    await logBillingAudit({
+      userId,
+      action: "credits_addon_granted",
+      provider: "paystack",
+      reference: fulfillmentKey,
+      metadata: { amount },
+    });
+
+    await createNotification(userId, {
+      category: "billing",
+      title: "Credits added",
+      description: `${amount.toLocaleString()} AI credits were added to your account.`,
+      actionLabel: "View Billing",
+      actionHref: "/dashboard/billing",
+      actionTone: "primary",
+    });
+  } catch (err) {
+    await releaseFulfillment(
+      fulfillmentKey,
+      err instanceof Error ? err.message : "credits_addon_failed"
+    );
+    throw err;
+  }
 }
 
 async function recordInvoice(input: {
@@ -428,70 +507,123 @@ type VerifiedTransaction = {
 };
 
 async function applySuccessfulCharge(tx: VerifiedTransaction) {
+  const {
+    claimFulfillment,
+    completeFulfillment,
+    releaseFulfillment,
+    logBillingAudit,
+  } = await import("./billingSafety");
+
   const meta = readMetadata(tx.metadata);
   const userId = meta.userId;
   if (!userId) return;
 
-  const customerCode = tx.customer?.customer_code ?? null;
-  if (customerCode) {
-    await savePaystackFields(userId, { paystack_customer_code: customerCode });
+  const fulfillmentKey = `paystack_tx:${tx.reference}`;
+  const claimed = await claimFulfillment(fulfillmentKey, "charge", userId, {
+    purpose: meta.purpose ?? null,
+  });
+  if (!claimed) {
+    await logBillingAudit({
+      userId,
+      action: "charge_fulfillment_skipped_duplicate",
+      provider: "paystack",
+      reference: tx.reference,
+    });
+    return;
   }
 
-  if (tx.authorization?.last4) {
-    const brand = String(tx.authorization.brand || "card").toLowerCase();
-    const expMonth = String(tx.authorization.exp_month ?? "").padStart(2, "0");
-    const expYear = String(tx.authorization.exp_year ?? "").slice(-2);
-    await supabaseAdmin
-      .from("billing_accounts")
-      .update({
-        payment_brand: brand.includes("master") ? "mastercard" : brand.includes("visa") ? "visa" : brand,
-        payment_last4: tx.authorization.last4,
-        payment_expiry: expMonth && expYear ? `${expMonth}/${expYear}` : null,
-        updated_at: new Date().toISOString(),
-      })
-      .eq("user_id", userId);
-  }
+  try {
+    const customerCode = tx.customer?.customer_code ?? null;
+    if (customerCode) {
+      await savePaystackFields(userId, { paystack_customer_code: customerCode });
+    }
 
-  if (meta.purpose === "credits_addon") {
-    await grantCreditsAddon(userId);
+    if (tx.authorization?.last4) {
+      const brand = String(tx.authorization.brand || "card").toLowerCase();
+      const expMonth = String(tx.authorization.exp_month ?? "").padStart(2, "0");
+      const expYear = String(tx.authorization.exp_year ?? "").slice(-2);
+      await supabaseAdmin
+        .from("billing_accounts")
+        .update({
+          payment_brand: brand.includes("master") ? "mastercard" : brand.includes("visa") ? "visa" : brand,
+          payment_last4: tx.authorization.last4,
+          payment_expiry: expMonth && expYear ? `${expMonth}/${expYear}` : null,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("user_id", userId);
+    }
+
+    if (meta.purpose === "credits_addon") {
+      await grantCreditsAddon(userId, `paystack_credits:${tx.reference}`);
+      await recordInvoice({
+        userId,
+        id: `paystack_${tx.reference}`,
+        amountKobo: tx.amount,
+        currency: tx.currency || currency(),
+        description: "AI credits add-on",
+        status: "paid",
+        paidAt: tx.paid_at,
+      });
+      await completeFulfillment(fulfillmentKey);
+      await logBillingAudit({
+        userId,
+        action: "charge_fulfilled",
+        provider: "paystack",
+        reference: tx.reference,
+        metadata: { purpose: "credits_addon" },
+      });
+      return;
+    }
+
+    const planCode = typeof tx.plan === "string" ? tx.plan : tx.plan?.plan_code;
+    const planId =
+      planIdFromPlanCode(planCode) ??
+      (meta.planId === "pro" || meta.planId === "enterprise" || meta.planId === "scale"
+        ? meta.planId === "scale"
+          ? "enterprise"
+          : meta.planId
+        : null);
+    const interval: BillingInterval =
+      intervalFromPlanCode(planCode) === "yearly"
+        ? "yearly"
+        : normalizeBillingInterval(typeof meta.interval === "string" ? meta.interval : undefined);
+
+    if (planId === "pro" || planId === "enterprise") {
+      const renews = new Date();
+      if (interval === "yearly") renews.setFullYear(renews.getFullYear() + 1);
+      else renews.setMonth(renews.getMonth() + 1);
+      await applyPaidPlan(userId, planId, renews.toISOString(), interval);
+    }
+
     await recordInvoice({
       userId,
       id: `paystack_${tx.reference}`,
       amountKobo: tx.amount,
       currency: tx.currency || currency(),
-      description: "AI credits add-on",
+      description:
+        (typeof tx.plan === "object" && tx.plan?.name) ||
+        (planId
+          ? `${getTierCatalog()[planId].name} subscription${interval === "yearly" ? " (yearly)" : ""}`
+          : "Convert Tide subscription"),
       status: "paid",
       paidAt: tx.paid_at,
     });
-    return;
+
+    await completeFulfillment(fulfillmentKey);
+    await logBillingAudit({
+      userId,
+      action: "charge_fulfilled",
+      provider: "paystack",
+      reference: tx.reference,
+      metadata: { planId, interval },
+    });
+  } catch (err) {
+    await releaseFulfillment(
+      fulfillmentKey,
+      err instanceof Error ? err.message : "charge_fulfillment_failed"
+    );
+    throw err;
   }
-
-  const planCode = typeof tx.plan === "string" ? tx.plan : tx.plan?.plan_code;
-  const planId =
-    planIdFromPlanCode(planCode) ??
-    (meta.planId === "pro" || meta.planId === "enterprise" || meta.planId === "scale"
-      ? meta.planId === "scale"
-        ? "enterprise"
-        : meta.planId
-      : null);
-
-  if (planId === "pro" || planId === "enterprise") {
-    const renews = new Date();
-    renews.setMonth(renews.getMonth() + 1);
-    await applyPaidPlan(userId, planId, renews.toISOString());
-  }
-
-  await recordInvoice({
-    userId,
-    id: `paystack_${tx.reference}`,
-    amountKobo: tx.amount,
-    currency: tx.currency || currency(),
-    description:
-      (typeof tx.plan === "object" && tx.plan?.name) ||
-      (planId ? `${getTierCatalog()[planId].name} subscription` : "Convert Tide subscription"),
-    status: "paid",
-    paidAt: tx.paid_at,
-  });
 }
 
 export async function verifyPaystackReference(reference: string) {
@@ -512,17 +644,39 @@ type PaystackWebhookEvent = {
 };
 
 export async function handlePaystackWebhook(rawBody: Buffer, signature: string | undefined) {
-  if (!signature) throw new Error("Missing x-paystack-signature header");
+  const {
+    beginWebhookEvent,
+    completeWebhookEvent,
+    failWebhookEvent,
+    httpError,
+    logBillingAudit,
+  } = await import("./billingSafety");
+
+  if (!signature) throw httpError("Missing x-paystack-signature header", 400);
 
   const hash = crypto.createHmac("sha512", secretKey()).update(rawBody).digest("hex");
   if (hash !== signature) {
-    throw new Error("Invalid Paystack webhook signature");
+    throw httpError("Invalid Paystack webhook signature", 400);
   }
 
   const payload = JSON.parse(rawBody.toString("utf8")) as PaystackWebhookEvent;
   const event = payload.event;
   const data = payload.data || {};
 
+  const dataId =
+    (typeof data.id === "number" || typeof data.id === "string" ? String(data.id) : null) ||
+    (typeof data.reference === "string" ? data.reference : null) ||
+    (typeof data.invoice_code === "string" ? data.invoice_code : null) ||
+    (typeof data.subscription_code === "string" ? data.subscription_code : null) ||
+    crypto.createHash("sha256").update(rawBody).digest("hex").slice(0, 32);
+
+  const eventId = `${event}:${dataId}`;
+  const claim = await beginWebhookEvent("paystack", eventId, event);
+  if (claim === "already_completed" || claim === "retry") {
+    return { received: true, type: event, duplicate: true };
+  }
+
+  try {
   switch (event) {
     case "charge.success": {
       await applySuccessfulCharge(data as unknown as VerifiedTransaction);
@@ -607,6 +761,7 @@ export async function handlePaystackWebhook(rawBody: Buffer, signature: string |
       }
 
       const planId = planIdFromPlanCode(plan?.plan_code);
+      const interval = intervalFromPlanCode(plan?.plan_code);
       const nextPayment =
         typeof data.next_payment_date === "string" ? new Date(data.next_payment_date).toISOString() : null;
 
@@ -619,7 +774,7 @@ export async function handlePaystackWebhook(rawBody: Buffer, signature: string |
       }
 
       if (planId && event === "subscription.create") {
-        await applyPaidPlan(userId, planId, nextPayment);
+        await applyPaidPlan(userId, planId, nextPayment, interval);
       }
       break;
     }
@@ -661,5 +816,20 @@ export async function handlePaystackWebhook(rawBody: Buffer, signature: string |
       break;
   }
 
+  await completeWebhookEvent("paystack", eventId);
+  await logBillingAudit({
+    action: "webhook_processed",
+    provider: "paystack",
+    reference: eventId,
+    metadata: { type: event },
+  });
   return { received: true, type: event };
+  } catch (err) {
+    await failWebhookEvent(
+      "paystack",
+      eventId,
+      err instanceof Error ? err.message : "webhook_failed"
+    );
+    throw err;
+  }
 }

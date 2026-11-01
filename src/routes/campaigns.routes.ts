@@ -1,14 +1,36 @@
 import { Router } from "express";
 import { supabaseAdmin } from "../config/supabase";
-import { authenticateToken, type AuthRequest } from "../middleware/auth";
+import { authenticateToken } from "../middleware/auth";
+import { attachBusinessContext, type BusinessAuthRequest } from "../middleware/businessContext";
 import { asyncHandler } from "../middleware/errorHandler";
-import { createCampaignSchema, updateCampaignSchema } from "../schemas/campaign.schema";
+import {
+  createCampaignSchema,
+  publishCampaignSchema,
+  publishPreviewQuerySchema,
+  updateCampaignSchema,
+} from "../schemas/campaign.schema";
 import { buildCampaignPayload } from "../services/generators";
 import { createNotification } from "../services/notifications";
 import { consumeCredits, CREDIT_COSTS, InsufficientCreditsError } from "../services/billing";
 import { ensureUserSettings } from "../services/settings";
+import {
+  claimIdempotencyKey,
+  completeIdempotencyKey,
+  failIdempotencyKey,
+} from "../services/idempotency";
+import {
+  buildPublishPreview,
+  executePublish,
+  listPublishes,
+  revokePublish,
+} from "../services/campaignPublish";
+import { logAccountAudit } from "../services/accountAudit";
 
 const router = Router();
+
+function paramId(value: string | string[] | undefined): string {
+  return Array.isArray(value) ? String(value[0] ?? "") : String(value ?? "");
+}
 
 type CampaignRow = {
   id: string;
@@ -26,6 +48,7 @@ type CampaignRow = {
 };
 
 function toCampaign(row: CampaignRow) {
+  const stats = (row.stats ?? {}) as Record<string, unknown>;
   return {
     id: row.id,
     personaId: row.persona_id,
@@ -36,6 +59,9 @@ function toCampaign(row: CampaignRow) {
     status: row.status ?? "active",
     duration: row.duration ?? undefined,
     conversions: row.conversions ?? undefined,
+    targetChannels: Array.isArray(stats.targetChannels)
+      ? (stats.targetChannels as string[])
+      : [],
     stats: row.stats,
     tabs: row.tabs,
   };
@@ -44,6 +70,7 @@ function toCampaign(row: CampaignRow) {
 /** Attach selected library assets to a newly created campaign. */
 async function linkAssetsToCampaign(
   userId: string,
+  businessId: string,
   campaignId: string,
   campaignName: string,
   personaId: string | null,
@@ -60,6 +87,7 @@ async function linkAssetsToCampaign(
       persona_name: personaName ?? "",
     })
     .eq("user_id", userId)
+    .eq("business_id", businessId)
     .in("id", assetIds);
 }
 
@@ -67,7 +95,8 @@ async function linkAssetsToCampaign(
 router.get(
   "/",
   authenticateToken,
-  asyncHandler(async (req: AuthRequest, res) => {
+  attachBusinessContext,
+  asyncHandler(async (req: BusinessAuthRequest, res) => {
     const page = Math.max(1, parseInt(String(req.query.page ?? "1"), 10) || 1);
     const limit = Math.min(100, Math.max(1, parseInt(String(req.query.limit ?? "6"), 10) || 6));
     const search = typeof req.query.search === "string" ? req.query.search.trim() : "";
@@ -79,7 +108,7 @@ router.get(
     let query = supabaseAdmin
       .from("campaigns")
       .select("*", { count: "exact" })
-      .eq("user_id", req.user!.id);
+      .eq("user_id", req.user!.id).eq("business_id", req.businessId!);
 
     if (status && status !== "all") {
       query = query.eq("status", status);
@@ -110,56 +139,190 @@ router.get(
 router.post(
   "/generate",
   authenticateToken,
-  asyncHandler(async (req: AuthRequest, res) => {
+  attachBusinessContext,
+  asyncHandler(async (req: BusinessAuthRequest, res) => {
     const parsed = createCampaignSchema.safeParse(req.body);
     if (!parsed.success) {
       return res.status(400).json({ success: false, message: "personaId is required" });
     }
 
+    const clientRequestId = parsed.data.clientRequestId?.trim();
+    if (clientRequestId) {
+      const claim = await claimIdempotencyKey({
+        userId: req.user!.id,
+        businessId: req.businessId,
+        scope: "campaign_generate",
+        requestKey: clientRequestId,
+      });
+
+      if (claim.kind === "completed") {
+        const cached = claim.response?.campaign;
+        if (cached) {
+          return res.status(200).json({
+            success: true,
+            data: { campaign: cached, replayed: true },
+          });
+        }
+        if (claim.resourceId) {
+          const { data: existing } = await supabaseAdmin
+            .from("campaigns")
+            .select("*")
+            .eq("user_id", req.user!.id)
+            .eq("business_id", req.businessId!)
+            .eq("id", claim.resourceId)
+            .maybeSingle();
+          if (existing) {
+            return res.status(200).json({
+              success: true,
+              data: { campaign: toCampaign(existing as CampaignRow), replayed: true },
+            });
+          }
+        }
+      }
+
+      if (claim.kind === "processing") {
+        return res.status(409).json({
+          success: false,
+          message: "Campaign generation already in progress for this request. Retry shortly.",
+        });
+      }
+
+      if (claim.kind === "failed") {
+        return res.status(409).json({
+          success: false,
+          message: claim.message || "Previous generation failed. Use a new clientRequestId to retry.",
+        });
+      }
+    }
+
     const { data: persona, error: personaError } = await supabaseAdmin
       .from("personas")
-      .select("id, name, demographics")
-      .eq("user_id", req.user!.id)
+      .select(
+        "id, name, demographics, psychographics, pain_points, goals, buying_triggers"
+      )
+      .eq("user_id", req.user!.id).eq("business_id", req.businessId!)
       .eq("id", parsed.data.personaId)
       .maybeSingle();
 
-    if (personaError) return res.status(500).json({ success: false, message: personaError.message });
-    if (!persona) return res.status(404).json({ success: false, message: "Persona not found" });
+    if (personaError) {
+      if (clientRequestId) {
+        await failIdempotencyKey({
+          userId: req.user!.id,
+          scope: "campaign_generate",
+          requestKey: clientRequestId,
+          message: personaError.message,
+        });
+      }
+      return res.status(500).json({ success: false, message: personaError.message });
+    }
+    if (!persona) {
+      if (clientRequestId) {
+        await failIdempotencyKey({
+          userId: req.user!.id,
+          scope: "campaign_generate",
+          requestKey: clientRequestId,
+          message: "Persona not found",
+        });
+      }
+      return res.status(404).json({ success: false, message: "Persona not found" });
+    }
 
+    let payload: Awaited<ReturnType<typeof buildCampaignPayload>>;
     try {
-      await consumeCredits(req.user!.id, CREDIT_COSTS.campaign, "campaign_generate");
+      const aiPrefs = (await ensureUserSettings(req.user!.id)).ai;
+      payload = await buildCampaignPayload(
+        req.user!.id,
+        {
+          id: persona.id,
+          name: persona.name,
+          demographics: persona.demographics,
+          psychographics: persona.psychographics,
+          pain_points: persona.pain_points,
+          goals: persona.goals,
+          buying_triggers: persona.buying_triggers,
+        },
+        parsed.data.name,
+        parsed.data.durationDays,
+        aiPrefs,
+        parsed.data.channels
+      );
     } catch (err) {
-      if (err instanceof InsufficientCreditsError) {
-        return res.status(402).json({ success: false, message: err.message });
+      const message = err instanceof Error ? err.message : "Campaign generation failed";
+      if (clientRequestId) {
+        await failIdempotencyKey({
+          userId: req.user!.id,
+          scope: "campaign_generate",
+          requestKey: clientRequestId,
+          message,
+        });
       }
       throw err;
     }
-
-    const aiPrefs = (await ensureUserSettings(req.user!.id)).ai;
-    const payload = await buildCampaignPayload(
-      req.user!.id,
-      { id: persona.id, name: persona.name, demographics: persona.demographics },
-      parsed.data.name,
-      parsed.data.durationDays,
-      aiPrefs
-    );
 
     const { data, error } = await supabaseAdmin
       .from("campaigns")
       .insert({
         user_id: req.user!.id,
+        business_id: req.businessId,
         ...payload,
       })
       .select("*")
       .single();
 
     if (error || !data) {
-      return res.status(500).json({ success: false, message: error?.message || "Failed to create campaign" });
+      const message = error?.message || "Failed to create campaign";
+      if (clientRequestId) {
+        await failIdempotencyKey({
+          userId: req.user!.id,
+          scope: "campaign_generate",
+          requestKey: clientRequestId,
+          message,
+        });
+      }
+      return res.status(500).json({ success: false, message });
+    }
+
+    // Charge only after the campaign row exists so failed attempts never create dupes or bill twice.
+    try {
+      await consumeCredits(req.user!.id, CREDIT_COSTS.campaign, "campaign_generate", req.businessId);
+    } catch (err) {
+      await supabaseAdmin.from("campaigns").delete().eq("id", (data as CampaignRow).id);
+      const message =
+        err instanceof InsufficientCreditsError
+          ? err.message
+          : err instanceof Error
+            ? err.message
+            : "Credit charge failed";
+      if (clientRequestId) {
+        await failIdempotencyKey({
+          userId: req.user!.id,
+          scope: "campaign_generate",
+          requestKey: clientRequestId,
+          message,
+        });
+      }
+      if (err instanceof InsufficientCreditsError) {
+        return res.status(402).json({ success: false, message: err.message });
+      }
+      throw err;
+    }
+
+    const campaign = toCampaign(data as CampaignRow);
+
+    if (clientRequestId) {
+      await completeIdempotencyKey({
+        userId: req.user!.id,
+        scope: "campaign_generate",
+        requestKey: clientRequestId,
+        resourceId: campaign.id,
+        response: { campaign },
+      });
     }
 
     await linkAssetsToCampaign(
       req.user!.id,
-      (data as CampaignRow).id,
+      req.businessId!,
+      campaign.id,
       payload.name,
       persona.id,
       persona.name,
@@ -171,11 +334,20 @@ router.post(
       title: "Campaign Ready",
       description: `${payload.name} generation complete. All assets, audience segments, and schedule windows are now live.`,
       actionLabel: "View Campaign",
-      actionHref: `/dashboard/campaigns/${data.id}`,
+      actionHref: `/dashboard/campaigns/${campaign.id}`,
       actionTone: "primary",
     });
 
-    return res.status(201).json({ success: true, data: { campaign: toCampaign(data as CampaignRow) } });
+    await logAccountAudit({
+      userId: req.user!.id,
+      businessId: req.businessId,
+      action: "campaign.generate",
+      actor: "user",
+      reference: campaign.id,
+      metadata: { clientRequestId: clientRequestId || null, name: campaign.name },
+    });
+
+    return res.status(201).json({ success: true, data: { campaign } });
   })
 );
 
@@ -183,7 +355,8 @@ router.post(
 router.post(
   "/draft",
   authenticateToken,
-  asyncHandler(async (req: AuthRequest, res) => {
+  attachBusinessContext,
+  asyncHandler(async (req: BusinessAuthRequest, res) => {
     const parsed = createCampaignSchema.safeParse(req.body);
     if (!parsed.success) {
       return res.status(400).json({ success: false, message: "personaId is required" });
@@ -192,7 +365,7 @@ router.post(
     const { data: persona, error: personaError } = await supabaseAdmin
       .from("personas")
       .select("id, name")
-      .eq("user_id", req.user!.id)
+      .eq("user_id", req.user!.id).eq("business_id", req.businessId!)
       .eq("id", parsed.data.personaId)
       .maybeSingle();
 
@@ -207,6 +380,7 @@ router.post(
       .from("campaigns")
       .insert({
         user_id: req.user!.id,
+        business_id: req.businessId,
         persona_id: persona.id,
         persona_name: persona.name,
         name,
@@ -220,6 +394,8 @@ router.post(
           emotionalAngles: 0,
           readingScore: 0,
           readingScoreLabel: "Draft",
+          targetChannels: parsed.data.channels ?? [],
+          platforms: [],
         },
         tabs: [],
       })
@@ -232,6 +408,7 @@ router.post(
 
     await linkAssetsToCampaign(
       req.user!.id,
+      req.businessId!,
       (data as CampaignRow).id,
       name,
       persona.id,
@@ -242,15 +419,17 @@ router.post(
     return res.status(201).json({ success: true, data: { campaign: toCampaign(data as CampaignRow) } });
   })
 );
+
 // GET /api/campaigns/:id
 router.get(
   "/:id",
   authenticateToken,
-  asyncHandler(async (req: AuthRequest, res) => {
+  attachBusinessContext,
+  asyncHandler(async (req: BusinessAuthRequest, res) => {
     const { data, error } = await supabaseAdmin
       .from("campaigns")
       .select("*")
-      .eq("user_id", req.user!.id)
+      .eq("user_id", req.user!.id).eq("business_id", req.businessId!)
       .eq("id", req.params.id)
       .maybeSingle();
 
@@ -264,11 +443,12 @@ router.get(
 router.post(
   "/:id/duplicate",
   authenticateToken,
-  asyncHandler(async (req: AuthRequest, res) => {
+  attachBusinessContext,
+  asyncHandler(async (req: BusinessAuthRequest, res) => {
     const { data: original, error: fetchError } = await supabaseAdmin
       .from("campaigns")
       .select("*")
-      .eq("user_id", req.user!.id)
+      .eq("user_id", req.user!.id).eq("business_id", req.businessId!)
       .eq("id", req.params.id)
       .maybeSingle();
 
@@ -280,6 +460,7 @@ router.post(
       .from("campaigns")
       .insert({
         user_id: req.user!.id,
+        business_id: req.businessId,
         persona_id: source.persona_id,
         persona_name: source.persona_name,
         name: `${source.name} (Copy)`,
@@ -304,7 +485,8 @@ router.post(
 router.patch(
   "/:id",
   authenticateToken,
-  asyncHandler(async (req: AuthRequest, res) => {
+  attachBusinessContext,
+  asyncHandler(async (req: BusinessAuthRequest, res) => {
     const parsed = updateCampaignSchema.safeParse(req.body);
     if (!parsed.success) {
       return res.status(400).json({ success: false, message: "Invalid campaign update" });
@@ -318,7 +500,7 @@ router.patch(
     const { data, error } = await supabaseAdmin
       .from("campaigns")
       .update(updates)
-      .eq("user_id", req.user!.id)
+      .eq("user_id", req.user!.id).eq("business_id", req.businessId!)
       .eq("id", req.params.id)
       .select("*")
       .maybeSingle();
@@ -333,11 +515,12 @@ router.patch(
 router.delete(
   "/:id",
   authenticateToken,
-  asyncHandler(async (req: AuthRequest, res) => {
+  attachBusinessContext,
+  asyncHandler(async (req: BusinessAuthRequest, res) => {
     const { data, error } = await supabaseAdmin
       .from("campaigns")
       .delete()
-      .eq("user_id", req.user!.id)
+      .eq("user_id", req.user!.id).eq("business_id", req.businessId!)
       .eq("id", req.params.id)
       .select("id")
       .maybeSingle();
@@ -345,6 +528,162 @@ router.delete(
     if (error) return res.status(500).json({ success: false, message: error.message });
     if (!data) return res.status(404).json({ success: false, message: "Campaign not found" });
     return res.json({ success: true, message: "Campaign deleted" });
+  })
+);
+
+// GET /api/campaigns/:id/publish/preview?platform=meta|google_ads
+router.get(
+  "/:id/publish/preview",
+  authenticateToken,
+  attachBusinessContext,
+  asyncHandler(async (req: BusinessAuthRequest, res) => {
+    const parsed = publishPreviewQuerySchema.safeParse({
+      platform: req.query.platform ?? "meta",
+    });
+    if (!parsed.success) {
+      return res.status(400).json({ success: false, message: "platform must be meta or google_ads" });
+    }
+
+    try {
+      const preview = await buildPublishPreview({
+        userId: req.user!.id,
+        businessId: req.businessId!,
+        campaignId: paramId(req.params.id),
+        platform: parsed.data.platform,
+      });
+      return res.json({ success: true, data: { preview } });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Preview failed";
+      if (/not found/i.test(message)) {
+        return res.status(404).json({ success: false, message });
+      }
+      return res.status(400).json({ success: false, message });
+    }
+  })
+);
+
+// POST /api/campaigns/:id/publish
+router.post(
+  "/:id/publish",
+  authenticateToken,
+  attachBusinessContext,
+  asyncHandler(async (req: BusinessAuthRequest, res) => {
+    const parsed = publishCampaignSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({
+        success: false,
+        message: "platform, previewToken, and clientRequestId are required",
+      });
+    }
+
+    const campaignId = paramId(req.params.id);
+    const idemKey = `${campaignId}:${parsed.data.platform}:${parsed.data.clientRequestId}`;
+
+    const claim = await claimIdempotencyKey({
+      userId: req.user!.id,
+      businessId: req.businessId,
+      scope: "campaign_publish",
+      requestKey: idemKey,
+    });
+
+    if (claim.kind === "completed" && claim.response?.publish) {
+      return res.status(200).json({
+        success: true,
+        data: { publish: claim.response.publish, replayed: true },
+      });
+    }
+    if (claim.kind === "processing") {
+      return res.status(409).json({
+        success: false,
+        message: "Publish already in progress for this request. Retry shortly.",
+      });
+    }
+
+    try {
+      const result = await executePublish({
+        userId: req.user!.id,
+        businessId: req.businessId!,
+        campaignId,
+        platform: parsed.data.platform,
+        previewToken: parsed.data.previewToken,
+        idempotencyKey: parsed.data.clientRequestId,
+      });
+
+      await completeIdempotencyKey({
+        userId: req.user!.id,
+        scope: "campaign_publish",
+        requestKey: idemKey,
+        resourceId: result.publish.id,
+        response: { publish: result.publish },
+      });
+
+      return res.status(result.replayed ? 200 : 201).json({
+        success: true,
+        data: { publish: result.publish, replayed: result.replayed ?? false },
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Publish failed";
+      await failIdempotencyKey({
+        userId: req.user!.id,
+        scope: "campaign_publish",
+        requestKey: idemKey,
+        message,
+      });
+      if (/not found/i.test(message)) {
+        return res.status(404).json({ success: false, message });
+      }
+      if (/preview|connect|authorized|expired|token/i.test(message)) {
+        return res.status(400).json({ success: false, message });
+      }
+      if (/in progress/i.test(message)) {
+        return res.status(409).json({ success: false, message });
+      }
+      return res.status(500).json({ success: false, message });
+    }
+  })
+);
+
+// GET /api/campaigns/:id/publishes
+router.get(
+  "/:id/publishes",
+  authenticateToken,
+  attachBusinessContext,
+  asyncHandler(async (req: BusinessAuthRequest, res) => {
+    try {
+      const publishes = await listPublishes({
+        userId: req.user!.id,
+        businessId: req.businessId!,
+        campaignId: paramId(req.params.id),
+      });
+      return res.json({ success: true, data: { publishes } });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Failed to list publishes";
+      return res.status(500).json({ success: false, message });
+    }
+  })
+);
+
+// POST /api/campaigns/:id/publishes/:publishId/revoke
+router.post(
+  "/:id/publishes/:publishId/revoke",
+  authenticateToken,
+  attachBusinessContext,
+  asyncHandler(async (req: BusinessAuthRequest, res) => {
+    try {
+      const result = await revokePublish({
+        userId: req.user!.id,
+        businessId: req.businessId!,
+        campaignId: paramId(req.params.id),
+        publishId: paramId(req.params.publishId),
+      });
+      return res.json({ success: true, data: { publish: result } });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Revoke failed";
+      if (/not found/i.test(message)) {
+        return res.status(404).json({ success: false, message });
+      }
+      return res.status(400).json({ success: false, message });
+    }
   })
 );
 

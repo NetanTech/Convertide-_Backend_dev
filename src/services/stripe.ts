@@ -1,13 +1,16 @@
 import Stripe from "stripe";
 import { supabaseAdmin } from "../config/supabase";
 import {
+  applyBillingIntervalDisplay,
   changePlan,
   ensureBillingAccount,
   formatPlanDate,
   getTierCatalog,
   hasActiveProviderSubscription,
+  normalizeBillingInterval,
   setCancelAtPeriodEnd,
   setPendingPlanChange,
+  type BillingInterval,
   type PlanTierId,
 } from "./billing";
 import { createNotification } from "./notifications";
@@ -36,7 +39,27 @@ function stripe(): Stripe {
   return stripeClient;
 }
 
-function priceIdForTier(planId: "pro" | "enterprise"): string {
+function priceIdForTier(
+  planId: "pro" | "enterprise",
+  interval: BillingInterval = "monthly"
+): string {
+  if (interval === "yearly") {
+    const yearlyMap = {
+      pro: process.env.STRIPE_PRICE_PRO_YEARLY?.trim() || "",
+      enterprise:
+        process.env.STRIPE_PRICE_ENTERPRISE_YEARLY?.trim() ||
+        process.env.STRIPE_PRICE_SCALE_YEARLY?.trim() ||
+        "",
+    };
+    const yearlyId = yearlyMap[planId];
+    if (!yearlyId) {
+      throw new Error(
+        `Missing Stripe yearly price for ${planId}. Set STRIPE_PRICE_${planId === "pro" ? "PRO" : "ENTERPRISE"}_YEARLY (annual = 10× monthly / 2 months free).`
+      );
+    }
+    return yearlyId;
+  }
+
   const map = {
     pro: process.env.STRIPE_PRICE_PRO?.trim() || "",
     enterprise:
@@ -55,14 +78,33 @@ function priceIdForTier(planId: "pro" | "enterprise"): string {
 
 function planIdFromPriceId(priceId: string | null | undefined): "pro" | "enterprise" | null {
   if (!priceId) return null;
-  if (priceId === process.env.STRIPE_PRICE_PRO?.trim()) return "pro";
+  if (
+    priceId === process.env.STRIPE_PRICE_PRO?.trim() ||
+    priceId === process.env.STRIPE_PRICE_PRO_YEARLY?.trim()
+  ) {
+    return "pro";
+  }
   if (
     priceId === process.env.STRIPE_PRICE_ENTERPRISE?.trim() ||
-    priceId === process.env.STRIPE_PRICE_SCALE?.trim()
+    priceId === process.env.STRIPE_PRICE_SCALE?.trim() ||
+    priceId === process.env.STRIPE_PRICE_ENTERPRISE_YEARLY?.trim() ||
+    priceId === process.env.STRIPE_PRICE_SCALE_YEARLY?.trim()
   ) {
     return "enterprise";
   }
   return null;
+}
+
+function intervalFromPriceId(priceId: string | null | undefined): BillingInterval {
+  if (!priceId) return "monthly";
+  if (
+    priceId === process.env.STRIPE_PRICE_PRO_YEARLY?.trim() ||
+    priceId === process.env.STRIPE_PRICE_ENTERPRISE_YEARLY?.trim() ||
+    priceId === process.env.STRIPE_PRICE_SCALE_YEARLY?.trim()
+  ) {
+    return "yearly";
+  }
+  return "monthly";
 }
 
 function normalizePaidPlanId(
@@ -235,7 +277,8 @@ async function scheduleTierChange(
  */
 export async function changePlanInPlace(
   userId: string,
-  planId: "pro" | "enterprise"
+  planId: "pro" | "enterprise",
+  interval: BillingInterval = "monthly"
 ): Promise<InPlacePlanChange | null> {
   if (!isStripeConfigured()) return null;
 
@@ -255,12 +298,24 @@ export async function changePlanInPlace(
   const item = subscription.items.data[0];
   if (!item) return null;
 
-  const newPriceId = priceIdForTier(planId);
+  const newPriceId = priceIdForTier(planId, interval);
   const currentPriceId = typeof item.price === "string" ? item.price : item.price?.id;
   const currentPlanId = planIdFromPriceId(currentPriceId);
+  const currentInterval = intervalFromPriceId(currentPriceId);
+
+  if (currentPriceId === newPriceId) {
+    return { effective: "immediate", effectiveAt: new Date().toISOString(), planId };
+  }
 
   const rank = { pro: 1, enterprise: 2 } as const;
-  const isUpgrade = !currentPlanId || rank[planId] > rank[currentPlanId];
+  const isTierUpgrade = !currentPlanId || rank[planId] > rank[currentPlanId];
+  // Monthly → yearly is an upgrade (prepay more, unlock 2 months free).
+  const isIntervalUpgrade =
+    Boolean(currentPlanId) &&
+    currentPlanId === planId &&
+    currentInterval === "monthly" &&
+    interval === "yearly";
+  const isUpgrade = isTierUpgrade || isIntervalUpgrade;
   const periodEnd = subscriptionPeriodEnd(subscription);
   const periodEndIso = periodEnd ? new Date(periodEnd * 1000).toISOString() : null;
 
@@ -309,7 +364,8 @@ export async function changePlanInPlace(
   await applyPaidPlan(
     userId,
     planId,
-    updatedPeriodEnd ? new Date(updatedPeriodEnd * 1000).toISOString() : periodEndIso
+    updatedPeriodEnd ? new Date(updatedPeriodEnd * 1000).toISOString() : periodEndIso,
+    interval
   );
 
   return { effective: "immediate", effectiveAt: new Date().toISOString(), planId };
@@ -319,8 +375,10 @@ export async function createPlanCheckoutSession(input: {
   userId: string;
   email: string;
   planId: "pro" | "enterprise";
+  interval?: BillingInterval;
 }): Promise<{ url: string }> {
-  const priceId = priceIdForTier(input.planId);
+  const interval = normalizeBillingInterval(input.interval);
+  const priceId = priceIdForTier(input.planId, interval);
   const customerId = await ensureStripeCustomer(input.userId, input.email);
 
   const session = await stripe().checkout.sessions.create({
@@ -333,12 +391,14 @@ export async function createPlanCheckoutSession(input: {
     metadata: {
       userId: input.userId,
       planId: input.planId,
+      interval,
       purpose: "plan",
     },
     subscription_data: {
       metadata: {
         userId: input.userId,
         planId: input.planId,
+        interval,
         purpose: "plan",
       },
     },
@@ -418,10 +478,16 @@ async function adoptSubscription(userId: string, subscriptionId: string) {
   }
 }
 
-async function applyPaidPlan(userId: string, planId: "pro" | "enterprise", renewsOn: string | null) {
+async function applyPaidPlan(
+  userId: string,
+  planId: "pro" | "enterprise",
+  renewsOn: string | null,
+  interval: BillingInterval = "monthly"
+) {
   const before = await ensureBillingAccount(userId);
 
   await changePlan(userId, planId);
+  await applyBillingIntervalDisplay(userId, planId, interval);
   await setCancelAtPeriodEnd(userId, false);
   await setPendingPlanChange(userId, null, null);
   if (renewsOn) {
@@ -430,43 +496,72 @@ async function applyPaidPlan(userId: string, planId: "pro" | "enterprise", renew
   await cancelOtherProviderSubscription(userId, "stripe");
 
   // Stripe emits `subscription.updated` for renewals and cancellations too, so only
-  // announce a plan that actually moved.
-  if (before.plan_id === planId) return;
+  // announce a plan that actually moved (or interval changed).
+  const beforeInterval = /year/i.test(before.billing_cycle) ? "yearly" : "monthly";
+  if (before.plan_id === planId && beforeInterval === interval) return;
 
   const tierName = getTierCatalog()[planId as PlanTierId]?.name ?? "your plan";
   const renewsLabel = formatPlanDate(renewsOn);
+  const intervalLabel = interval === "yearly" ? " (billed yearly — 2 months free)" : "";
   await createNotification(userId, {
     category: "billing",
     title: "Subscription updated",
     description: renewsLabel
-      ? `Your Convert Tide plan is now ${tierName}, effective immediately. Next renewal ${renewsLabel}.`
-      : `Your Convert Tide plan is now ${tierName}, effective immediately.`,
+      ? `Your Convert Tide plan is now ${tierName}${intervalLabel}, effective immediately. Next renewal ${renewsLabel}.`
+      : `Your Convert Tide plan is now ${tierName}${intervalLabel}, effective immediately.`,
     actionLabel: "View Billing",
     actionHref: "/dashboard/billing",
     actionTone: "primary",
   });
 }
 
-async function grantCreditsAddon(userId: string, amount = 1000) {
-  const account = await ensureBillingAccount(userId);
-  const { error } = await supabaseAdmin
-    .from("billing_accounts")
-    .update({
-      credits_total: account.credits_total + amount,
-      updated_at: new Date().toISOString(),
-    })
-    .eq("user_id", userId);
+async function grantCreditsAddon(userId: string, fulfillmentKey: string, amount = 1000) {
+  const {
+    claimFulfillment,
+    completeFulfillment,
+    releaseFulfillment,
+    logBillingAudit,
+  } = await import("./billingSafety");
 
-  if (error) throw new Error(error.message);
+  const claimed = await claimFulfillment(fulfillmentKey, "credits_addon", userId, { amount });
+  if (!claimed) return;
 
-  await createNotification(userId, {
-    category: "billing",
-    title: "Credits added",
-    description: `${amount.toLocaleString()} AI credits were added to your account.`,
-    actionLabel: "View Billing",
-    actionHref: "/dashboard/billing",
-    actionTone: "primary",
-  });
+  try {
+    const account = await ensureBillingAccount(userId);
+    const { error } = await supabaseAdmin
+      .from("billing_accounts")
+      .update({
+        credits_total: account.credits_total + amount,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("user_id", userId);
+
+    if (error) throw new Error(error.message);
+
+    await completeFulfillment(fulfillmentKey);
+    await logBillingAudit({
+      userId,
+      action: "credits_addon_granted",
+      provider: "stripe",
+      reference: fulfillmentKey,
+      metadata: { amount },
+    });
+
+    await createNotification(userId, {
+      category: "billing",
+      title: "Credits added",
+      description: `${amount.toLocaleString()} AI credits were added to your account.`,
+      actionLabel: "View Billing",
+      actionHref: "/dashboard/billing",
+      actionTone: "primary",
+    });
+  } catch (err) {
+    await releaseFulfillment(
+      fulfillmentKey,
+      err instanceof Error ? err.message : "credits_addon_failed"
+    );
+    throw err;
+  }
 }
 
 async function recordInvoice(input: {
@@ -550,6 +645,13 @@ function subscriptionPeriodEnd(subscription: Stripe.Subscription): number | null
 }
 
 async function applyCheckoutSession(session: Stripe.Checkout.Session) {
+  const {
+    claimFulfillment,
+    completeFulfillment,
+    releaseFulfillment,
+    logBillingAudit,
+  } = await import("./billingSafety");
+
   const userId =
     session.metadata?.userId ||
     session.client_reference_id ||
@@ -557,59 +659,105 @@ async function applyCheckoutSession(session: Stripe.Checkout.Session) {
 
   if (!userId) return;
 
-  const customerId = typeof session.customer === "string" ? session.customer : session.customer?.id;
-  if (customerId) {
-    await saveStripeFields(userId, { stripe_customer_id: customerId });
-  }
-
-  if (session.metadata?.purpose === "credits_addon" || session.mode === "payment") {
-    if (session.metadata?.purpose === "credits_addon") {
-      await grantCreditsAddon(userId);
-      await recordInvoice({
-        userId,
-        id: `stripe_${session.id}`,
-        amountCents: session.amount_total ?? 0,
-        currency: session.currency || "usd",
-        description: "AI credits add-on",
-        status: "paid",
-      });
-    }
+  const fulfillmentKey = `stripe_checkout:${session.id}`;
+  const claimed = await claimFulfillment(fulfillmentKey, "checkout_session", userId, {
+    mode: session.mode,
+    purpose: session.metadata?.purpose ?? null,
+  });
+  if (!claimed) {
+    await logBillingAudit({
+      userId,
+      action: "checkout_fulfillment_skipped_duplicate",
+      provider: "stripe",
+      reference: session.id,
+    });
     return;
   }
 
-  const subscriptionId =
-    typeof session.subscription === "string" ? session.subscription : session.subscription?.id;
+  try {
+    const customerId = typeof session.customer === "string" ? session.customer : session.customer?.id;
+    if (customerId) {
+      await saveStripeFields(userId, { stripe_customer_id: customerId });
+    }
 
-  let planId: "pro" | "enterprise" | null =
-    normalizePaidPlanId(session.metadata?.planId);
+    if (session.metadata?.purpose === "credits_addon" || session.mode === "payment") {
+      if (session.metadata?.purpose === "credits_addon") {
+        await grantCreditsAddon(userId, `stripe_credits:${session.id}`);
+        await recordInvoice({
+          userId,
+          id: `stripe_${session.id}`,
+          amountCents: session.amount_total ?? 0,
+          currency: session.currency || "usd",
+          description: "AI credits add-on",
+          status: "paid",
+        });
+      }
+      await completeFulfillment(fulfillmentKey);
+      await logBillingAudit({
+        userId,
+        action: "checkout_fulfilled",
+        provider: "stripe",
+        reference: session.id,
+        metadata: { purpose: session.metadata?.purpose ?? "payment" },
+      });
+      return;
+    }
 
-  let renewsOn: string | null = null;
+    const subscriptionId =
+      typeof session.subscription === "string" ? session.subscription : session.subscription?.id;
 
-  if (subscriptionId) {
-    const subscription = await stripe().subscriptions.retrieve(subscriptionId);
-    await adoptSubscription(userId, subscription.id);
-    await syncPaymentMethodFromSubscription(userId, subscription);
+    let planId: "pro" | "enterprise" | null =
+      normalizePaidPlanId(session.metadata?.planId);
+    let interval: BillingInterval = normalizeBillingInterval(session.metadata?.interval);
 
-    const priceId = subscription.items.data[0]?.price?.id;
-    planId = planIdFromPriceId(priceId) ?? planId;
-    const periodEnd = subscriptionPeriodEnd(subscription);
-    renewsOn = periodEnd ? new Date(periodEnd * 1000).toISOString() : null;
+    let renewsOn: string | null = null;
+
+    if (subscriptionId) {
+      const subscription = await stripe().subscriptions.retrieve(subscriptionId);
+      await adoptSubscription(userId, subscription.id);
+      await syncPaymentMethodFromSubscription(userId, subscription);
+
+      const priceId = subscription.items.data[0]?.price?.id;
+      planId = planIdFromPriceId(priceId) ?? planId;
+      if (intervalFromPriceId(priceId) === "yearly") {
+        interval = "yearly";
+      } else if (subscription.metadata?.interval) {
+        interval = normalizeBillingInterval(subscription.metadata.interval);
+      }
+      const periodEnd = subscriptionPeriodEnd(subscription);
+      renewsOn = periodEnd ? new Date(periodEnd * 1000).toISOString() : null;
+    }
+
+    if (planId === "pro" || planId === "enterprise") {
+      await applyPaidPlan(userId, planId, renewsOn, interval);
+    }
+
+    await recordInvoice({
+      userId,
+      id: `stripe_${session.id}`,
+      amountCents: session.amount_total ?? 0,
+      currency: session.currency || "usd",
+      description: planId
+        ? `${getTierCatalog()[planId].name} subscription${interval === "yearly" ? " (yearly)" : ""}`
+        : "Convert Tide subscription",
+      status: "paid",
+    });
+
+    await completeFulfillment(fulfillmentKey);
+    await logBillingAudit({
+      userId,
+      action: "checkout_fulfilled",
+      provider: "stripe",
+      reference: session.id,
+      metadata: { planId, interval },
+    });
+  } catch (err) {
+    await releaseFulfillment(
+      fulfillmentKey,
+      err instanceof Error ? err.message : "checkout_fulfillment_failed"
+    );
+    throw err;
   }
-
-  if (planId === "pro" || planId === "enterprise") {
-    await applyPaidPlan(userId, planId, renewsOn);
-  }
-
-  await recordInvoice({
-    userId,
-    id: `stripe_${session.id}`,
-    amountCents: session.amount_total ?? 0,
-    currency: session.currency || "usd",
-    description: planId
-      ? `${getTierCatalog()[planId].name} subscription`
-      : "Convert Tide subscription",
-    status: "paid",
-  });
 }
 
 export async function verifyStripeCheckoutSession(sessionId: string) {
@@ -621,12 +769,31 @@ export async function verifyStripeCheckoutSession(sessionId: string) {
 }
 
 export async function handleStripeWebhook(rawBody: Buffer, signature: string | undefined) {
+  const {
+    beginWebhookEvent,
+    completeWebhookEvent,
+    failWebhookEvent,
+    httpError,
+    logBillingAudit,
+  } = await import("./billingSafety");
+
   const secret = process.env.STRIPE_WEBHOOK_SECRET?.trim();
-  if (!secret) throw new Error("STRIPE_WEBHOOK_SECRET is not configured");
-  if (!signature) throw new Error("Missing stripe-signature header");
+  if (!secret) throw httpError("STRIPE_WEBHOOK_SECRET is not configured", 500);
+  if (!signature) throw httpError("Missing stripe-signature header", 400);
 
-  const event = stripe().webhooks.constructEvent(rawBody, signature, secret);
+  let event: Stripe.Event;
+  try {
+    event = stripe().webhooks.constructEvent(rawBody, signature, secret);
+  } catch {
+    throw httpError("Invalid Stripe webhook signature", 400);
+  }
 
+  const claim = await beginWebhookEvent("stripe", event.id, event.type);
+  if (claim === "already_completed" || claim === "retry") {
+    return { received: true, type: event.type, duplicate: true };
+  }
+
+  try {
   switch (event.type) {
     case "checkout.session.completed": {
       await applyCheckoutSession(event.data.object as Stripe.Checkout.Session);
@@ -655,6 +822,10 @@ export async function handleStripeWebhook(rawBody: Buffer, signature: string | u
       const priceId = subscription.items.data[0]?.price?.id;
       const planId =
         planIdFromPriceId(priceId) ?? normalizePaidPlanId(subscription.metadata?.planId);
+      const interval: BillingInterval =
+        intervalFromPriceId(priceId) === "yearly"
+          ? "yearly"
+          : normalizeBillingInterval(subscription.metadata?.interval);
 
       if (
         planId &&
@@ -663,7 +834,8 @@ export async function handleStripeWebhook(rawBody: Buffer, signature: string | u
         await applyPaidPlan(
           userId,
           planId,
-          periodEnd ? new Date(periodEnd * 1000).toISOString() : null
+          periodEnd ? new Date(periodEnd * 1000).toISOString() : null,
+          interval
         );
         // Stripe owns this flag once a subscription exists; mirror it so the dashboard
         // can say "access until" instead of "renews on".
@@ -723,5 +895,20 @@ export async function handleStripeWebhook(rawBody: Buffer, signature: string | u
       break;
   }
 
+  await completeWebhookEvent("stripe", event.id);
+  await logBillingAudit({
+    action: "webhook_processed",
+    provider: "stripe",
+    reference: event.id,
+    metadata: { type: event.type },
+  });
   return { received: true, type: event.type };
+  } catch (err) {
+    await failWebhookEvent(
+      "stripe",
+      event.id,
+      err instanceof Error ? err.message : "webhook_failed"
+    );
+    throw err;
+  }
 }

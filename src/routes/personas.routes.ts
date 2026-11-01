@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { supabaseAdmin } from "../config/supabase";
-import { authenticateToken, type AuthRequest } from "../middleware/auth";
+import { authenticateToken } from "../middleware/auth";
+import { attachBusinessContext, type BusinessAuthRequest } from "../middleware/businessContext";
 import { asyncHandler } from "../middleware/errorHandler";
 import { onboardingInputSchema } from "../schemas/persona.schema";
 import { generatePersona } from "../services/personaGenerator";
@@ -9,8 +10,37 @@ import { markOnboardingCompleted } from "../services/profile";
 import { consumeCredits, CREDIT_COSTS, InsufficientCreditsError } from "../services/billing";
 import { ensureUserSettings } from "../services/settings";
 import { maybeAutoSaveAiCopy } from "../services/autoSaveAssets";
+import {
+  getPersonaVersion,
+  listPersonaVersions,
+  savePersonaVersion,
+  updatesFromSnapshot,
+} from "../services/personaVersions";
+import { z } from "zod";
+import {
+  BusinessContextImportError,
+  importBusinessContextFromUrl,
+} from "../services/businessContextImport";
+import { updateBusinessProfile } from "../services/businessProfiles";
+import {
+  listPersonaDependents,
+  regeneratePersonaDependents,
+} from "../services/personaDependents";
 
 const router = Router();
+
+const importContextSchema = z.object({
+  url: z.string().min(1).max(2048),
+  consent: z.literal(true),
+  /** When true, empty business profile name/industry may be filled from import (never overwrites). */
+  applyToBusinessProfile: z.boolean().optional(),
+});
+
+const regenerateDependentsSchema = z.object({
+  confirm: z.literal(true),
+  campaignIds: z.array(z.string().uuid()).max(50).optional(),
+  planIds: z.array(z.string().uuid()).max(50).optional(),
+});
 
 type PersonaRow = {
   id: string;
@@ -54,21 +84,114 @@ function toPersona(row: PersonaRow) {
   };
 }
 
-// POST /api/personas/generate
+// POST /api/personas/import-context — website business context (consent required)
 router.post(
-  "/generate",
+  "/import-context",
   authenticateToken,
-  asyncHandler(async (req: AuthRequest, res) => {
-    const parsedInput = onboardingInputSchema.safeParse(req.body);
-    if (!parsedInput.success) {
+  attachBusinessContext,
+  asyncHandler(async (req: BusinessAuthRequest, res) => {
+    const parsed = importContextSchema.safeParse(req.body);
+    if (!parsed.success) {
+      const consentMissing = parsed.error.issues.some((i) => i.path.includes("consent"));
       return res.status(400).json({
         success: false,
-        message: "Please complete all required fields before generating a persona.",
+        code: consentMissing ? "consent_required" : "invalid_url",
+        message: consentMissing
+          ? "Confirm consent to import public business details before continuing."
+          : "Enter a valid website URL to import from.",
       });
     }
 
     try {
-      await consumeCredits(req.user!.id, CREDIT_COSTS.persona, "persona_generate");
+      const result = await importBusinessContextFromUrl({
+        userId: req.user!.id,
+        businessId: req.businessId!,
+        url: parsed.data.url,
+        consent: parsed.data.consent,
+      });
+
+      if (parsed.data.applyToBusinessProfile) {
+        const patch: { name?: string; industry?: string } = {};
+        // Only fill empty profile fields — never silently overwrite.
+        const { data: profile } = await supabaseAdmin
+          .from("business_profiles")
+          .select("id, name, industry")
+          .eq("id", req.businessId!)
+          .eq("user_id", req.user!.id)
+          .maybeSingle();
+
+        if (profile) {
+          const row = profile as { name?: string | null; industry?: string | null };
+          if (result.fields.businessName && !String(row.name ?? "").trim()) {
+            patch.name = result.fields.businessName;
+          }
+          if (result.fields.industry && !String(row.industry ?? "").trim()) {
+            patch.industry = result.fields.industry;
+          }
+          if (Object.keys(patch).length > 0) {
+            await updateBusinessProfile(req.user!.id, req.businessId!, patch);
+          }
+        }
+      }
+
+      return res.json({
+        success: true,
+        data: {
+          import: result,
+          recovery:
+            result.partial
+              ? "Partial import — review attributed fields, edit anything incorrect, then continue."
+              : null,
+        },
+      });
+    } catch (err) {
+      if (err instanceof BusinessContextImportError) {
+        const status =
+          err.code === "consent_required"
+            ? 403
+            : err.code === "unreachable"
+              ? 502
+              : 400;
+        return res.status(status).json({
+          success: false,
+          code: err.code,
+          message: err.message,
+          data: {
+            recovery:
+              err.code === "linkedin_unsupported"
+                ? "Use your company website URL, or fill the form manually."
+                : err.code === "invalid_url"
+                  ? "Example: https://www.yourcompany.com"
+                  : err.code === "unreachable" || err.code === "empty_page"
+                    ? "Try another public page, or enter details manually."
+                    : "You can skip import and continue with the form.",
+          },
+        });
+      }
+      throw err;
+    }
+  })
+);
+
+// POST /api/personas/generate
+router.post(
+  "/generate",
+  authenticateToken,
+  attachBusinessContext,
+  asyncHandler(async (req: BusinessAuthRequest, res) => {
+    const parsedInput = onboardingInputSchema.safeParse(req.body);
+    if (!parsedInput.success) {
+      const detail =
+        parsedInput.error.issues.find((issue) => issue.message)?.message ||
+        "Please complete all required fields before generating a persona.";
+      return res.status(400).json({
+        success: false,
+        message: detail,
+      });
+    }
+
+    try {
+      await consumeCredits(req.user!.id, CREDIT_COSTS.persona, "persona_generate", req.businessId);
     } catch (err) {
       if (err instanceof InsufficientCreditsError) {
         return res.status(402).json({ success: false, message: err.message });
@@ -83,6 +206,7 @@ router.post(
       .from("personas")
       .insert({
         user_id: req.user!.id,
+        business_id: req.businessId,
         name: generated.name,
         confidence: generated.confidence,
         confidence_label: generated.confidenceLabel,
@@ -130,7 +254,8 @@ router.post(
 router.get(
   "/",
   authenticateToken,
-  asyncHandler(async (req: AuthRequest, res) => {
+  attachBusinessContext,
+  asyncHandler(async (req: BusinessAuthRequest, res) => {
     const page = Math.max(1, parseInt(String(req.query.page ?? "1"), 10) || 1);
     const limit = Math.min(100, Math.max(1, parseInt(String(req.query.limit ?? "20"), 10) || 20));
     const search = typeof req.query.search === "string" ? req.query.search.trim() : "";
@@ -140,7 +265,8 @@ router.get(
     let query = supabaseAdmin
       .from("personas")
       .select("*", { count: "exact" })
-      .eq("user_id", req.user!.id);
+      .eq("user_id", req.user!.id)
+      .eq("business_id", req.businessId!);
 
     if (search) {
       query = query.ilike("name", `%${search}%`);
@@ -167,11 +293,13 @@ router.get(
 router.get(
   "/:id",
   authenticateToken,
-  asyncHandler(async (req: AuthRequest, res) => {
+  attachBusinessContext,
+  asyncHandler(async (req: BusinessAuthRequest, res) => {
     const { data, error } = await supabaseAdmin
       .from("personas")
       .select("*")
       .eq("user_id", req.user!.id)
+      .eq("business_id", req.businessId!)
       .eq("id", req.params.id)
       .maybeSingle();
 
@@ -186,15 +314,112 @@ router.get(
   })
 );
 
+// GET /api/personas/:id/versions
+router.get(
+  "/:id/versions",
+  authenticateToken,
+  attachBusinessContext,
+  asyncHandler(async (req: BusinessAuthRequest, res) => {
+    const personaId = String(req.params.id);
+    const { data: existing, error: fetchError } = await supabaseAdmin
+      .from("personas")
+      .select("id")
+      .eq("user_id", req.user!.id)
+      .eq("business_id", req.businessId!)
+      .eq("id", personaId)
+      .maybeSingle();
+
+    if (fetchError) {
+      return res.status(500).json({ success: false, message: fetchError.message });
+    }
+    if (!existing) {
+      return res.status(404).json({ success: false, message: "Persona not found" });
+    }
+
+    try {
+      const versions = await listPersonaVersions(req.user!.id, personaId);
+      return res.json({ success: true, data: { versions } });
+    } catch (err) {
+      return res.status(500).json({
+        success: false,
+        message: err instanceof Error ? err.message : "Could not load versions",
+      });
+    }
+  })
+);
+
+// POST /api/personas/:id/versions/:versionId/restore
+router.post(
+  "/:id/versions/:versionId/restore",
+  authenticateToken,
+  attachBusinessContext,
+  asyncHandler(async (req: BusinessAuthRequest, res) => {
+    const personaId = String(req.params.id);
+    const versionId = String(req.params.versionId);
+
+    const { data: existing, error: fetchError } = await supabaseAdmin
+      .from("personas")
+      .select("*")
+      .eq("user_id", req.user!.id)
+      .eq("business_id", req.businessId!)
+      .eq("id", personaId)
+      .maybeSingle();
+
+    if (fetchError) {
+      return res.status(500).json({ success: false, message: fetchError.message });
+    }
+    if (!existing) {
+      return res.status(404).json({ success: false, message: "Persona not found" });
+    }
+
+    const version = await getPersonaVersion(req.user!.id, personaId, versionId);
+    if (!version) {
+      return res.status(404).json({ success: false, message: "Version not found" });
+    }
+
+    // Keep the live state before restoring so restore itself is reversible.
+    await savePersonaVersion({
+      userId: req.user!.id,
+      personaId,
+      row: existing as Record<string, unknown>,
+      reason: "restore",
+    });
+
+    const { data, error } = await supabaseAdmin
+      .from("personas")
+      .update(updatesFromSnapshot(version.snapshot))
+      .eq("user_id", req.user!.id)
+      .eq("business_id", req.businessId!)
+      .eq("id", personaId)
+      .select("*")
+      .single();
+
+    if (error || !data) {
+      return res.status(500).json({
+        success: false,
+        message: error?.message || "Failed to restore persona version",
+      });
+    }
+
+    return res.json({
+      success: true,
+      message: `Restored version ${version.versionNumber}`,
+      data: { persona: toPersona(data as PersonaRow) },
+    });
+  })
+);
+
 // POST /api/personas/:id/duplicate
 router.post(
   "/:id/duplicate",
   authenticateToken,
-  asyncHandler(async (req: AuthRequest, res) => {
+  attachBusinessContext,
+  asyncHandler(async (req: BusinessAuthRequest, res) => {
     const { data: original, error: fetchError } = await supabaseAdmin
       .from("personas")
       .select("*")
       .eq("user_id", req.user!.id)
+      .eq("business_id", req.businessId!)
       .eq("id", req.params.id)
       .maybeSingle();
 
@@ -206,6 +431,7 @@ router.post(
       .from("personas")
       .insert({
         user_id: req.user!.id,
+        business_id: req.businessId,
         name: `${source.name} (Copy)`,
         confidence: source.confidence,
         confidence_label: source.confidence_label,
@@ -230,15 +456,87 @@ router.post(
   })
 );
 
+// GET /api/personas/:id/dependents
+router.get(
+  "/:id/dependents",
+  authenticateToken,
+  attachBusinessContext,
+  asyncHandler(async (req: BusinessAuthRequest, res) => {
+    const personaId = String(req.params.id);
+    const { data: existing, error: fetchError } = await supabaseAdmin
+      .from("personas")
+      .select("id")
+      .eq("user_id", req.user!.id)
+      .eq("business_id", req.businessId!)
+      .eq("id", personaId)
+      .maybeSingle();
+
+    if (fetchError) {
+      return res.status(500).json({ success: false, message: fetchError.message });
+    }
+    if (!existing) {
+      return res.status(404).json({ success: false, message: "Persona not found" });
+    }
+
+    try {
+      const dependents = await listPersonaDependents({
+        userId: req.user!.id,
+        businessId: req.businessId!,
+        personaId,
+      });
+      return res.json({ success: true, data: { dependents } });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Failed to list dependents";
+      return res.status(500).json({ success: false, message });
+    }
+  })
+);
+
+// POST /api/personas/:id/regenerate-dependents
+router.post(
+  "/:id/regenerate-dependents",
+  authenticateToken,
+  attachBusinessContext,
+  asyncHandler(async (req: BusinessAuthRequest, res) => {
+    const parsed = regenerateDependentsSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({
+        success: false,
+        message: "Confirm regeneration to update campaigns and plans linked to this persona.",
+      });
+    }
+
+    const personaId = String(req.params.id);
+    try {
+      const result = await regeneratePersonaDependents({
+        userId: req.user!.id,
+        businessId: req.businessId!,
+        personaId,
+        campaignIds: parsed.data.campaignIds,
+        planIds: parsed.data.planIds,
+      });
+      return res.json({ success: true, data: result });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Failed to regenerate dependents";
+      if (/not found/i.test(message)) {
+        return res.status(404).json({ success: false, message });
+      }
+      return res.status(500).json({ success: false, message });
+    }
+  })
+);
+
 // PATCH /api/personas/:id
 router.patch(
   "/:id",
   authenticateToken,
-  asyncHandler(async (req: AuthRequest, res) => {
+  attachBusinessContext,
+  asyncHandler(async (req: BusinessAuthRequest, res) => {
     const { data: existing, error: fetchError } = await supabaseAdmin
       .from("personas")
       .select("*")
       .eq("user_id", req.user!.id)
+      .eq("business_id", req.businessId!)
       .eq("id", req.params.id)
       .maybeSingle();
 
@@ -264,10 +562,24 @@ router.patch(
       return res.status(400).json({ success: false, message: "No editable fields provided." });
     }
 
+    try {
+      await savePersonaVersion({
+        userId: req.user!.id,
+        personaId: String(req.params.id),
+        row: existing as Record<string, unknown>,
+        reason: "edit",
+      });
+    } catch (err) {
+      console.warn("[persona-versions] snapshot before edit failed", err);
+    }
+
+    updates.updated_at = new Date().toISOString();
+
     const { data, error } = await supabaseAdmin
       .from("personas")
       .update(updates)
       .eq("user_id", req.user!.id)
+      .eq("business_id", req.businessId!)
       .eq("id", req.params.id)
       .select()
       .single();
@@ -284,11 +596,13 @@ router.patch(
 router.post(
   "/:id/regenerate",
   authenticateToken,
-  asyncHandler(async (req: AuthRequest, res) => {
+  attachBusinessContext,
+  asyncHandler(async (req: BusinessAuthRequest, res) => {
     const { data: existing, error: fetchError } = await supabaseAdmin
       .from("personas")
       .select("*")
       .eq("user_id", req.user!.id)
+      .eq("business_id", req.businessId!)
       .eq("id", req.params.id)
       .maybeSingle();
 
@@ -308,7 +622,7 @@ router.post(
     }
 
     try {
-      await consumeCredits(req.user!.id, CREDIT_COSTS.persona, "persona_regenerate");
+      await consumeCredits(req.user!.id, CREDIT_COSTS.persona, "persona_regenerate", req.businessId);
     } catch (err) {
       if (err instanceof InsufficientCreditsError) {
         return res.status(402).json({ success: false, message: err.message });
@@ -318,6 +632,17 @@ router.post(
 
     const aiPrefs = (await ensureUserSettings(req.user!.id)).ai;
     const generated = await generatePersona(req.user!.id, parsedInput.data, aiPrefs);
+
+    try {
+      await savePersonaVersion({
+        userId: req.user!.id,
+        personaId: String(req.params.id),
+        row: existing as Record<string, unknown>,
+        reason: "regenerate",
+      });
+    } catch (err) {
+      console.warn("[persona-versions] snapshot before regenerate failed", err);
+    }
 
     const { data, error } = await supabaseAdmin
       .from("personas")
@@ -333,8 +658,10 @@ router.post(
         buying_triggers: generated.buyingTriggers,
         objections: generated.objections,
         platform_preferences: generated.platformPreferences,
+        updated_at: new Date().toISOString(),
       })
       .eq("user_id", req.user!.id)
+      .eq("business_id", req.businessId!)
       .eq("id", req.params.id)
       .select()
       .single();
@@ -359,11 +686,13 @@ router.post(
 router.delete(
   "/:id",
   authenticateToken,
-  asyncHandler(async (req: AuthRequest, res) => {
+  attachBusinessContext,
+  asyncHandler(async (req: BusinessAuthRequest, res) => {
     const { data, error } = await supabaseAdmin
       .from("personas")
       .delete()
       .eq("user_id", req.user!.id)
+      .eq("business_id", req.businessId!)
       .eq("id", req.params.id)
       .select("id")
       .maybeSingle();

@@ -16,9 +16,14 @@ export type AiPrefs = {
   autoSaveAiResults: boolean;
 };
 
+export type SecurityPrefs = {
+  sessionTimeoutMinutes: number;
+};
+
 export type UserSettings = {
   notifications: NotificationPrefs;
   ai: AiPrefs;
+  security: SecurityPrefs;
 };
 
 type SettingsRow = {
@@ -32,6 +37,7 @@ type SettingsRow = {
   content_length: string;
   preferred_language: string;
   auto_save_ai_results: boolean;
+  session_timeout_minutes?: number | null;
 };
 
 const defaults: UserSettings = {
@@ -49,7 +55,15 @@ const defaults: UserSettings = {
     preferredLanguage: "",
     autoSaveAiResults: true,
   },
+  security: {
+    sessionTimeoutMinutes: 15,
+  },
 };
+
+function clampTimeout(minutes: number | null | undefined): number {
+  const n = typeof minutes === "number" && Number.isFinite(minutes) ? Math.round(minutes) : 15;
+  return Math.min(120, Math.max(5, n));
+}
 
 function toSettings(row: SettingsRow | null): UserSettings {
   if (!row) return defaults;
@@ -67,6 +81,9 @@ function toSettings(row: SettingsRow | null): UserSettings {
       contentLength: row.content_length ?? "",
       preferredLanguage: row.preferred_language ?? "",
       autoSaveAiResults: row.auto_save_ai_results,
+    },
+    security: {
+      sessionTimeoutMinutes: clampTimeout(row.session_timeout_minutes),
     },
   };
 }
@@ -102,6 +119,7 @@ export async function updateUserSettings(
   patch: {
     notifications?: Partial<NotificationPrefs>;
     ai?: Partial<AiPrefs>;
+    security?: Partial<SecurityPrefs>;
   }
 ): Promise<UserSettings> {
   await ensureUserSettings(userId);
@@ -109,6 +127,10 @@ export async function updateUserSettings(
   const updates: Record<string, unknown> = {
     updated_at: new Date().toISOString(),
   };
+
+  if (patch.security?.sessionTimeoutMinutes !== undefined) {
+    updates.session_timeout_minutes = clampTimeout(patch.security.sessionTimeoutMinutes);
+  }
 
   if (patch.notifications) {
     if (patch.notifications.personaGenerated !== undefined)
