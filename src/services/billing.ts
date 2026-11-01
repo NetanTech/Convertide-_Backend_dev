@@ -579,26 +579,42 @@ export async function consumeCredits(
   reason: string,
   businessId?: string | null
 ): Promise<BillingAccountRow> {
-  const account = await ensureBillingAccount(userId);
-  const remaining = Math.max(0, account.credits_total - account.credits_used);
+  // Optimistic lock + one retry so concurrent generates cannot overspend the plan pool.
+  let account = await ensureBillingAccount(userId);
+  let updated: BillingAccountRow | null = null;
 
-  if (amount > remaining) {
-    throw new InsufficientCreditsError(remaining, amount);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const remaining = Math.max(0, account.credits_total - account.credits_used);
+    if (amount > remaining) {
+      throw new InsufficientCreditsError(remaining, amount);
+    }
+
+    const nextUsed = account.credits_used + amount;
+    const { data, error } = await supabaseAdmin
+      .from("billing_accounts")
+      .update({
+        credits_used: nextUsed,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("user_id", userId)
+      .eq("credits_used", account.credits_used)
+      .select("*")
+      .maybeSingle();
+
+    if (error) {
+      throw new Error(error.message || "Failed to update credits");
+    }
+    if (data) {
+      updated = data as BillingAccountRow;
+      break;
+    }
+
+    account = await ensureBillingAccount(userId);
   }
 
-  const nextUsed = account.credits_used + amount;
-  const { data, error } = await supabaseAdmin
-    .from("billing_accounts")
-    .update({
-      credits_used: nextUsed,
-      updated_at: new Date().toISOString(),
-    })
-    .eq("user_id", userId)
-    .select("*")
-    .single();
-
-  if (error || !data) {
-    throw new Error(error?.message || "Failed to update credits");
+  if (!updated) {
+    const remaining = Math.max(0, account.credits_total - account.credits_used);
+    throw new InsufficientCreditsError(remaining, amount);
   }
 
   const { error: eventError } = await supabaseAdmin.from("billing_credit_events").insert({
@@ -638,11 +654,11 @@ export async function consumeCredits(
     }
   }
 
-  const updated = data as BillingAccountRow;
   const remainingAfter = Math.max(0, updated.credits_total - updated.credits_used);
+  const remainingBefore = remainingAfter + amount;
   const threshold = Math.max(1, Math.floor(updated.credits_total * 0.2));
   // Notify once when remaining credits cross below 20%.
-  if (remaining >= threshold && remainingAfter < threshold) {
+  if (remainingBefore >= threshold && remainingAfter < threshold) {
     const { createNotification } = await import("./notifications");
     void createNotification(userId, {
       category: "ai",

@@ -61,7 +61,8 @@ router.get(
         .order("created_at", { ascending: false })
         .limit(12),
       ensureBillingAccount(userId),
-      getMonthlyCreditUsage(userId, year, businessId),
+      // Account-level chart so sidebar/home match Billing (plan pool that gates access).
+      getMonthlyCreditUsage(userId, year, null),
     ]);
 
     if (personasCountRes.error) {
@@ -105,11 +106,13 @@ router.get(
           activePlans: plansActiveRes.count ?? 0,
         },
         credits: {
-          // Business-scoped usage; plan total still comes from the billing account.
-          used: req.business?.creditsUsed ?? account.credits_used,
-          total: req.business?.creditsTotal ?? account.credits_total,
+          // Plan pool that gates AI access (must match Billing page).
+          used: account.credits_used,
+          total: account.credits_total,
           accountUsed: account.credits_used,
           accountTotal: account.credits_total,
+          // Per-business usage for analytics only (OB-003).
+          businessUsed: req.business?.creditsUsed ?? 0,
           businessId: businessId,
         },
         creditsUsage: {
