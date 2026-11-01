@@ -12,6 +12,8 @@ import {
   formatPlanDate,
   getMonthlyCreditUsage,
   getTierCatalog,
+  getTierPricing,
+  normalizeBillingInterval,
   normalizePlanId,
   listPaymentMethods,
   setCancelAtPeriodEnd,
@@ -43,6 +45,7 @@ import {
 } from "../services/stripe";
 import { billingNotConfiguredMessage, checkoutProviderChoices, resolveBillingProvider, resolveBillingProviderForPortal } from "../services/billingProvider";
 import type { BillingProvider, ClientRegionHint } from "../services/billingProvider";
+import { logBillingAudit } from "../services/billingSafety";
 
 const router = Router();
 
@@ -151,6 +154,8 @@ router.get(
     const tiers = (Object.keys(catalog) as PlanTierId[]).map((id) => {
       const tier = catalog[id];
       const isCurrent = id === currentTierId;
+      const monthlyPricing = getTierPricing(id, "monthly");
+      const yearlyPricing = getTierPricing(id, "yearly");
 
       let cta = `Switch to ${tier.name}`;
       let ctaHref: string | undefined = undefined;
@@ -176,8 +181,11 @@ router.get(
         id,
         name: tier.name,
         description: tier.description,
-        price: tier.price,
-        cycle: tier.cycle,
+        price: monthlyPricing.price,
+        cycle: monthlyPricing.cycle,
+        yearlyPrice: yearlyPricing.price,
+        yearlyTotal: yearlyPricing.yearlyTotal,
+        yearlySavingsLabel: yearlyPricing.savingsLabel,
         features: tier.features,
         cta,
         ctaHref,
@@ -253,6 +261,7 @@ router.post(
     });
     const planId =
       parsed.data.planId === "scale" ? "enterprise" : parsed.data.planId;
+    const interval = normalizeBillingInterval(parsed.data.interval);
 
     if (planId === "free" || !provider) {
       // Moving to Free means "stop renewing". The paid month has already been charged,
@@ -299,6 +308,14 @@ router.post(
             actionTone: "warning",
           });
 
+          await logBillingAudit({
+            userId: req.user!.id,
+            action: "cancel_at_period_end",
+            actor: "user",
+            provider: provider ?? null,
+            metadata: { accessUntil, fromPlan: current.plan_id },
+          });
+
           return res.json({
             success: true,
             message: readableDate
@@ -323,6 +340,13 @@ router.post(
       // Nothing to cancel (already Free, or no processor configured) — switch outright.
       const account = await changePlan(req.user!.id, planId);
       await setCancelAtPeriodEnd(req.user!.id, false);
+      await logBillingAudit({
+        userId: req.user!.id,
+        action: "plan_changed",
+        actor: "user",
+        provider: provider ?? null,
+        metadata: { planId },
+      });
 
       await createNotification(req.user!.id, {
         category: "billing",
@@ -361,7 +385,11 @@ router.post(
       // An existing Stripe subscriber switches tier on the subscription itself. A second
       // checkout would bill the whole new plan on top of the period already paid for.
       if (provider === "stripe") {
-        const change = await stripeChangePlanInPlace(req.user!.id, planId as "pro" | "enterprise");
+        const change = await stripeChangePlanInPlace(
+          req.user!.id,
+          planId as "pro" | "enterprise",
+          interval
+        );
         if (change) {
           const account = await ensureBillingAccount(req.user!.id);
           const tierName = getTierCatalog()[change.planId].name;
@@ -401,11 +429,13 @@ router.post(
               userId: req.user!.id,
               email,
               planId: planId as "pro" | "enterprise",
+              interval,
             })
           : await createPaystackPlanCheckoutSession({
               userId: req.user!.id,
               email,
               planId: planId as "pro" | "enterprise",
+              interval,
             });
       return res.json({
         success: true,
@@ -446,6 +476,7 @@ router.post(
 
     const planId =
       parsed.data.planId === "scale" ? "enterprise" : parsed.data.planId;
+    const interval = normalizeBillingInterval(parsed.data.interval);
 
     if (planId === "free") {
       return res.status(400).json({ success: false, message: "The Free plan does not require checkout" });
@@ -460,7 +491,7 @@ router.post(
       // Same reasoning as /change-plan: update the live subscription rather than
       // charging a fresh one on top of the period already paid for.
       if (provider === "stripe") {
-        const change = await stripeChangePlanInPlace(req.user!.id, planId);
+        const change = await stripeChangePlanInPlace(req.user!.id, planId, interval);
         if (change) {
           return res.json({
             success: true,
@@ -479,11 +510,13 @@ router.post(
               userId: req.user!.id,
               email,
               planId,
+              interval,
             })
           : await createPaystackPlanCheckoutSession({
               userId: req.user!.id,
               email,
               planId,
+              interval,
             });
       return res.json({ success: true, data: { url: session.url } });
     } catch (err) {
@@ -599,11 +632,35 @@ router.post(
     try {
       if (sessionId) {
         const result = await verifyStripeCheckoutSession(sessionId);
+        await logBillingAudit({
+          userId: req.user!.id,
+          action: "payment_verified",
+          actor: "user",
+          provider: "stripe",
+          reference: sessionId,
+          metadata: { status: result.status },
+        });
         return res.json({ success: true, data: result });
       }
       const result = await verifyPaystackReference(reference);
+      await logBillingAudit({
+        userId: req.user!.id,
+        action: "payment_verified",
+        actor: "user",
+        provider: "paystack",
+        reference,
+        metadata: { status: result.status },
+      });
       return res.json({ success: true, data: result });
     } catch (err) {
+      await logBillingAudit({
+        userId: req.user!.id,
+        action: "payment_verify_failed",
+        actor: "user",
+        provider: sessionId ? "stripe" : "paystack",
+        reference: sessionId || reference,
+        metadata: { message: err instanceof Error ? err.message : "verify_failed" },
+      });
       return res.status(400).json({
         success: false,
         message: err instanceof Error ? err.message : "Could not verify payment",

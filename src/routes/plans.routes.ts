@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { supabaseAdmin } from "../config/supabase";
-import { authenticateToken, type AuthRequest } from "../middleware/auth";
+import { authenticateToken } from "../middleware/auth";
+import { attachBusinessContext, type BusinessAuthRequest } from "../middleware/businessContext";
 import { asyncHandler } from "../middleware/errorHandler";
 import { createPlanSchema, updatePlanSchema } from "../schemas/plan.schema";
 import { buildPlanPayload } from "../services/generators";
@@ -8,6 +9,13 @@ import { createNotification } from "../services/notifications";
 import { consumeCredits, CREDIT_COSTS, InsufficientCreditsError } from "../services/billing";
 import { ensureUserSettings } from "../services/settings";
 import { maybeAutoSaveAiCopy } from "../services/autoSaveAssets";
+import {
+  getPlanVersion,
+  isContentRevision,
+  listPlanVersions,
+  savePlanVersion,
+  updatesFromPlanSnapshot,
+} from "../services/planVersions";
 
 const router = Router();
 
@@ -58,7 +66,8 @@ function toPlan(row: PlanRow) {
 router.get(
   "/",
   authenticateToken,
-  asyncHandler(async (req: AuthRequest, res) => {
+  attachBusinessContext,
+  asyncHandler(async (req: BusinessAuthRequest, res) => {
     const page = Math.max(1, parseInt(String(req.query.page ?? "1"), 10) || 1);
     const limit = Math.min(100, Math.max(1, parseInt(String(req.query.limit ?? "8"), 10) || 8));
     const search = typeof req.query.search === "string" ? req.query.search.trim() : "";
@@ -70,7 +79,7 @@ router.get(
     let query = supabaseAdmin
       .from("plans")
       .select("*", { count: "exact" })
-      .eq("user_id", req.user!.id);
+      .eq("user_id", req.user!.id).eq("business_id", req.businessId!);
 
     if (status && status !== "all") {
       query = query.eq("status", status);
@@ -101,7 +110,8 @@ router.get(
 router.post(
   "/generate",
   authenticateToken,
-  asyncHandler(async (req: AuthRequest, res) => {
+  attachBusinessContext,
+  asyncHandler(async (req: BusinessAuthRequest, res) => {
     const parsed = createPlanSchema.safeParse(req.body);
     if (!parsed.success) {
       return res.status(400).json({ success: false, message: "personaId is required" });
@@ -110,7 +120,7 @@ router.post(
     const { data: persona, error: personaError } = await supabaseAdmin
       .from("personas")
       .select("id, name, demographics")
-      .eq("user_id", req.user!.id)
+      .eq("user_id", req.user!.id).eq("business_id", req.businessId!)
       .eq("id", parsed.data.personaId)
       .maybeSingle();
 
@@ -122,7 +132,7 @@ router.post(
       const { data: campaignRow, error: campaignError } = await supabaseAdmin
         .from("campaigns")
         .select("id, name")
-        .eq("user_id", req.user!.id)
+        .eq("user_id", req.user!.id).eq("business_id", req.businessId!)
         .eq("id", parsed.data.campaignId)
         .maybeSingle();
 
@@ -132,7 +142,7 @@ router.post(
     }
 
     try {
-      await consumeCredits(req.user!.id, CREDIT_COSTS.plan, "plan_generate");
+      await consumeCredits(req.user!.id, CREDIT_COSTS.plan, "plan_generate", req.businessId);
     } catch (err) {
       if (err instanceof InsufficientCreditsError) {
         return res.status(402).json({ success: false, message: err.message });
@@ -155,6 +165,7 @@ router.post(
       .from("plans")
       .insert({
         user_id: req.user!.id,
+        business_id: req.businessId,
         ...payload,
       })
       .select("*")
@@ -198,11 +209,12 @@ router.post(
 router.get(
   "/:id",
   authenticateToken,
-  asyncHandler(async (req: AuthRequest, res) => {
+  attachBusinessContext,
+  asyncHandler(async (req: BusinessAuthRequest, res) => {
     const { data, error } = await supabaseAdmin
       .from("plans")
       .select("*")
-      .eq("user_id", req.user!.id)
+      .eq("user_id", req.user!.id).eq("business_id", req.businessId!)
       .eq("id", req.params.id)
       .maybeSingle();
 
@@ -212,15 +224,136 @@ router.get(
   })
 );
 
+// GET /api/plans/:id/versions
+router.get(
+  "/:id/versions",
+  authenticateToken,
+  attachBusinessContext,
+  asyncHandler(async (req: BusinessAuthRequest, res) => {
+    const planId = String(req.params.id);
+    const { data: existing, error: fetchError } = await supabaseAdmin
+      .from("plans")
+      .select("id")
+      .eq("user_id", req.user!.id)
+      .eq("business_id", req.businessId!)
+      .eq("id", planId)
+      .maybeSingle();
+
+    if (fetchError) return res.status(500).json({ success: false, message: fetchError.message });
+    if (!existing) return res.status(404).json({ success: false, message: "Plan not found" });
+
+    try {
+      const versions = await listPlanVersions(req.user!.id, planId);
+      return res.json({ success: true, data: { versions } });
+    } catch (err) {
+      return res.status(500).json({
+        success: false,
+        message: err instanceof Error ? err.message : "Could not load versions",
+      });
+    }
+  })
+);
+
+// POST /api/plans/:id/versions/:versionId/restore
+router.post(
+  "/:id/versions/:versionId/restore",
+  authenticateToken,
+  attachBusinessContext,
+  asyncHandler(async (req: BusinessAuthRequest, res) => {
+    const planId = String(req.params.id);
+    const versionId = String(req.params.versionId);
+    const body = (req.body ?? {}) as {
+      confirmResetProgress?: unknown;
+      keepCurrentProgress?: unknown;
+    };
+    const confirmResetProgress = Boolean(body.confirmResetProgress);
+    const keepCurrentProgress = Boolean(body.keepCurrentProgress);
+
+    const { data: existing, error: fetchError } = await supabaseAdmin
+      .from("plans")
+      .select("*")
+      .eq("user_id", req.user!.id)
+      .eq("business_id", req.businessId!)
+      .eq("id", planId)
+      .maybeSingle();
+
+    if (fetchError) return res.status(500).json({ success: false, message: fetchError.message });
+    if (!existing) return res.status(404).json({ success: false, message: "Plan not found" });
+
+    const version = await getPlanVersion(req.user!.id, planId, versionId);
+    if (!version) {
+      return res.status(404).json({ success: false, message: "Version not found" });
+    }
+
+    const currentProgress = Number((existing as PlanRow).progress ?? 0);
+    const snapshotProgress = Number(version.snapshot.progress ?? 0);
+    const wouldResetProgress = currentProgress > 0 && snapshotProgress < currentProgress;
+
+    if (wouldResetProgress && !confirmResetProgress && !keepCurrentProgress) {
+      return res.status(409).json({
+        success: false,
+        code: "CONFIRM_RESET_PROGRESS",
+        message:
+          "Restoring this version would reduce completed progress. Confirm to reset progress, or keep your current progress.",
+        data: {
+          currentProgress,
+          restoredProgress: snapshotProgress,
+        },
+      });
+    }
+
+    try {
+      await savePlanVersion({
+        userId: req.user!.id,
+        planId,
+        row: existing as Record<string, unknown>,
+        reason: "restore",
+      });
+    } catch (err) {
+      console.warn("[plan-versions] snapshot before restore failed", err);
+    }
+
+    const updates = updatesFromPlanSnapshot(
+      version.snapshot,
+      keepCurrentProgress || (wouldResetProgress && !confirmResetProgress)
+        ? { preserveProgress: currentProgress }
+        : undefined
+    );
+
+    const { data, error } = await supabaseAdmin
+      .from("plans")
+      .update(updates)
+      .eq("user_id", req.user!.id)
+      .eq("business_id", req.businessId!)
+      .eq("id", planId)
+      .select("*")
+      .single();
+
+    if (error || !data) {
+      return res.status(500).json({
+        success: false,
+        message: error?.message || "Failed to restore plan version",
+      });
+    }
+
+    return res.json({
+      success: true,
+      message: `Restored version ${version.versionNumber}`,
+      data: { plan: toPlan(data as PlanRow) },
+    });
+  })
+);
+
 // POST /api/plans/:id/duplicate
 router.post(
   "/:id/duplicate",
   authenticateToken,
-  asyncHandler(async (req: AuthRequest, res) => {
+  attachBusinessContext,
+  asyncHandler(async (req: BusinessAuthRequest, res) => {
     const { data: original, error: fetchError } = await supabaseAdmin
       .from("plans")
       .select("*")
-      .eq("user_id", req.user!.id)
+      .eq("user_id", req.user!.id).eq("business_id", req.businessId!)
       .eq("id", req.params.id)
       .maybeSingle();
 
@@ -232,6 +365,7 @@ router.post(
       .from("plans")
       .insert({
         user_id: req.user!.id,
+        business_id: req.businessId,
         persona_id: source.persona_id,
         campaign_id: source.campaign_id,
         name: `${source.name} (Copy)`,
@@ -262,13 +396,40 @@ router.post(
 router.patch(
   "/:id",
   authenticateToken,
-  asyncHandler(async (req: AuthRequest, res) => {
+  attachBusinessContext,
+  asyncHandler(async (req: BusinessAuthRequest, res) => {
     const parsed = updatePlanSchema.safeParse(req.body);
     if (!parsed.success) {
       return res.status(400).json({ success: false, message: "Invalid plan update" });
     }
 
+    const planId = String(req.params.id);
+    const { data: existing, error: fetchError } = await supabaseAdmin
+      .from("plans")
+      .select("*")
+      .eq("user_id", req.user!.id)
+      .eq("business_id", req.businessId!)
+      .eq("id", planId)
+      .maybeSingle();
+
+    if (fetchError) return res.status(500).json({ success: false, message: fetchError.message });
+    if (!existing) return res.status(404).json({ success: false, message: "Plan not found" });
+
     const body = parsed.data;
+    const currentProgress = Number((existing as PlanRow).progress ?? 0);
+    const contentRevision = isContentRevision(body as Record<string, unknown>);
+
+    // Lowering progress (resetting completed work) requires explicit confirmation.
+    if (body.progress !== undefined && body.progress < currentProgress && !body.confirmResetProgress) {
+      return res.status(409).json({
+        success: false,
+        code: "CONFIRM_RESET_PROGRESS",
+        message:
+          "This update would reduce completed progress. Confirm to reset completed work, or leave progress unchanged.",
+        data: { currentProgress, requestedProgress: body.progress },
+      });
+    }
+
     const updates: Record<string, unknown> = {
       updated_at: new Date().toISOString(),
     };
@@ -281,13 +442,32 @@ router.patch(
     if (body.contentCalendar !== undefined) updates.content_calendar = body.contentCalendar;
     if (body.kpis !== undefined) updates.kpis = body.kpis;
     if (body.expectedOutcome !== undefined) updates.expected_outcome = body.expectedOutcome;
-    if (body.progress !== undefined) updates.progress = body.progress;
+    if (body.progress !== undefined) {
+      updates.progress = body.progress;
+    } else if (contentRevision) {
+      // Content revisions never wipe progress unless the client explicitly sets it.
+      updates.progress = currentProgress;
+    }
+
+    if (contentRevision || (body.progress !== undefined && body.progress !== currentProgress)) {
+      try {
+        await savePlanVersion({
+          userId: req.user!.id,
+          planId,
+          row: existing as Record<string, unknown>,
+          reason: "edit",
+        });
+      } catch (err) {
+        console.warn("[plan-versions] snapshot before edit failed", err);
+      }
+    }
 
     const { data, error } = await supabaseAdmin
       .from("plans")
       .update(updates)
       .eq("user_id", req.user!.id)
-      .eq("id", req.params.id)
+      .eq("business_id", req.businessId!)
+      .eq("id", planId)
       .select("*")
       .maybeSingle();
 
@@ -301,11 +481,12 @@ router.patch(
 router.delete(
   "/:id",
   authenticateToken,
-  asyncHandler(async (req: AuthRequest, res) => {
+  attachBusinessContext,
+  asyncHandler(async (req: BusinessAuthRequest, res) => {
     const { data, error } = await supabaseAdmin
       .from("plans")
       .delete()
-      .eq("user_id", req.user!.id)
+      .eq("user_id", req.user!.id).eq("business_id", req.businessId!)
       .eq("id", req.params.id)
       .select("id")
       .maybeSingle();

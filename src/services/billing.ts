@@ -2,6 +2,12 @@ import { supabaseAdmin } from "../config/supabase";
 
 export type PlanTierId = "free" | "pro" | "enterprise";
 
+/** Subscription billing interval. Yearly charges 10 months (2 months free). */
+export type BillingInterval = "monthly" | "yearly";
+
+/** Months charged on an annual subscription (12 − 2 free). */
+export const ANNUAL_MONTHS_CHARGED = 10;
+
 export type BillingAccountRow = {
   user_id: string;
   plan_id: PlanTierId;
@@ -44,7 +50,7 @@ export type PaymentMethodRow = {
 };
 
 // Static tier catalog. Prices/features live here rather than in the DB since
-// they're product config, not per-user data.
+// they're product config, not per-user data. Paid tiers: yearly = 10× monthly (2 months free).
 const TIER_CATALOG: Record<
   PlanTierId,
   {
@@ -52,6 +58,8 @@ const TIER_CATALOG: Record<
     description: string;
     price: string;
     cycle: string | null;
+    /** USD monthly list price; null for Free. */
+    monthlyUsd: number | null;
     features: string[];
     creditsTotal: number | null;
     seatsLimit: number | null;
@@ -64,6 +72,7 @@ const TIER_CATALOG: Record<
     description: "Get started with core AI marketing tools.",
     price: "Free",
     cycle: "mo",
+    monthlyUsd: null,
     features: ["500 AI Credits / mo", "1 Persona", "Basic campaign copy"],
     creditsTotal: 500,
     seatsLimit: 1,
@@ -75,6 +84,7 @@ const TIER_CATALOG: Record<
     description: "For growing teams running multiple campaigns.",
     price: "$49",
     cycle: "mo",
+    monthlyUsd: 49,
     features: ["5,000 AI Credits / mo", "5 Personas", "Email support"],
     creditsTotal: 5000,
     seatsLimit: 5,
@@ -86,6 +96,7 @@ const TIER_CATALOG: Record<
     description: "More capacity and priority support for scaling teams.",
     price: "$79",
     cycle: "mo",
+    monthlyUsd: 79,
     features: ["15,000 AI Credits / mo", "Unlimited personas", "Priority support"],
     creditsTotal: 15000,
     seatsLimit: 10,
@@ -96,6 +107,99 @@ const TIER_CATALOG: Record<
 
 export function getTierCatalog() {
   return TIER_CATALOG;
+}
+
+export function normalizeBillingInterval(value: string | null | undefined): BillingInterval {
+  const v = String(value ?? "").trim().toLowerCase();
+  if (v === "yearly" || v === "annual" || v === "year") return "yearly";
+  return "monthly";
+}
+
+export function intervalFromBillingCycle(billingCycle: string | null | undefined): BillingInterval {
+  return /year/i.test(String(billingCycle ?? "")) ? "yearly" : "monthly";
+}
+
+function formatUsd(amount: number): string {
+  if (Number.isInteger(amount)) return `$${amount}`;
+  return `$${amount.toFixed(2)}`;
+}
+
+/** Annual total in USD (10 months charged). */
+export function yearlyTotalUsd(planId: PlanTierId): number | null {
+  const monthly = TIER_CATALOG[planId].monthlyUsd;
+  if (monthly == null) return null;
+  return monthly * ANNUAL_MONTHS_CHARGED;
+}
+
+/** Monthly-equivalent display when billed yearly. */
+export function yearlyEquivalentMonthlyUsd(planId: PlanTierId): number | null {
+  const total = yearlyTotalUsd(planId);
+  if (total == null) return null;
+  return Math.round((total / 12) * 100) / 100;
+}
+
+export function getTierPricing(
+  planId: PlanTierId,
+  interval: BillingInterval = "monthly"
+): {
+  price: string;
+  cycle: string | null;
+  billingCycle: string;
+  yearlyTotal: string | null;
+  savingsLabel: string | null;
+} {
+  const tier = TIER_CATALOG[planId];
+  if (planId === "free" || tier.monthlyUsd == null) {
+    return {
+      price: "Free",
+      cycle: "mo",
+      billingCycle: "Free",
+      yearlyTotal: null,
+      savingsLabel: null,
+    };
+  }
+
+  if (interval === "yearly") {
+    const equiv = yearlyEquivalentMonthlyUsd(planId)!;
+    const total = yearlyTotalUsd(planId)!;
+    return {
+      price: formatUsd(equiv),
+      cycle: "mo",
+      billingCycle: "Billed yearly",
+      yearlyTotal: formatUsd(total),
+      savingsLabel: "2 months free",
+    };
+  }
+
+  return {
+    price: formatUsd(tier.monthlyUsd),
+    cycle: "mo",
+    billingCycle: "Billed monthly",
+    yearlyTotal: null,
+    savingsLabel: null,
+  };
+}
+
+/** Persist display price + billing cycle for the chosen interval. */
+export async function applyBillingIntervalDisplay(
+  userId: string,
+  planId: PlanTierId,
+  interval: BillingInterval
+): Promise<void> {
+  const pricing = getTierPricing(planId, interval);
+  const { error } = await supabaseAdmin
+    .from("billing_accounts")
+    .update({
+      plan_price: pricing.price,
+      plan_cycle: pricing.cycle,
+      billing_cycle: pricing.billingCycle,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("user_id", userId);
+
+  if (error) {
+    console.warn("[billing] applyBillingIntervalDisplay:", error.message);
+  }
 }
 
 /** Normalize legacy `scale` plan ids to `enterprise`. */
@@ -232,11 +336,14 @@ export async function ensureBillingAccount(userId: string): Promise<BillingAccou
     }
 
     const tier = TIER_CATALOG[planId];
+    const interval = intervalFromBillingCycle(raw.billing_cycle);
+    const pricing = getTierPricing(planId, interval);
     const needsSync =
       raw.plan_id !== planId ||
-      raw.plan_price !== tier.price ||
+      raw.plan_price !== pricing.price ||
       raw.plan_name !== tier.name ||
-      raw.plan_cycle !== (tier.cycle || raw.plan_cycle);
+      raw.plan_cycle !== (pricing.cycle || raw.plan_cycle) ||
+      raw.billing_cycle !== pricing.billingCycle;
 
     if (needsSync) {
       const { data: synced } = await supabaseAdmin
@@ -244,8 +351,9 @@ export async function ensureBillingAccount(userId: string): Promise<BillingAccou
         .update({
           plan_id: planId,
           plan_name: tier.name,
-          plan_price: tier.price,
-          plan_cycle: tier.cycle,
+          plan_price: pricing.price,
+          plan_cycle: pricing.cycle,
+          billing_cycle: pricing.billingCycle,
           seats_limit: tier.seatsLimit,
           projects: tier.projects,
           api_priority: tier.apiPriority,
@@ -294,6 +402,12 @@ export async function ensureBillingAccount(userId: string): Promise<BillingAccou
 export async function changePlan(userId: string, planId: PlanTierId): Promise<BillingAccountRow> {
   const normalized = normalizePlanId(planId);
   const tier = TIER_CATALOG[normalized];
+  const current = await ensureBillingAccount(userId);
+
+  // Same-plan renewal / webhook replay must not reset credit balances or seats.
+  if (current.plan_id === normalized) {
+    return current;
+  }
 
   const { data, error } = await supabaseAdmin
     .from("billing_accounts")
@@ -462,7 +576,8 @@ export class InsufficientCreditsError extends Error {
 export async function consumeCredits(
   userId: string,
   amount: number,
-  reason: string
+  reason: string,
+  businessId?: string | null
 ): Promise<BillingAccountRow> {
   const account = await ensureBillingAccount(userId);
   const remaining = Math.max(0, account.credits_total - account.credits_used);
@@ -490,10 +605,37 @@ export async function consumeCredits(
     user_id: userId,
     amount,
     reason,
+    ...(businessId ? { business_id: businessId } : {}),
   });
 
   if (eventError) {
     console.error("[billing] failed to record credit event", eventError.message);
+  }
+
+  // Per-business quota tracking (OB-003) — independent usage history per profile.
+  if (businessId) {
+    const { data: bizRow } = await supabaseAdmin
+      .from("business_profiles")
+      .select("credits_used")
+      .eq("id", businessId)
+      .eq("user_id", userId)
+      .maybeSingle();
+
+    if (bizRow) {
+      const bizUsed = (bizRow as { credits_used?: number }).credits_used ?? 0;
+      const { error: bizError } = await supabaseAdmin
+        .from("business_profiles")
+        .update({
+          credits_used: bizUsed + amount,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", businessId)
+        .eq("user_id", userId);
+
+      if (bizError) {
+        console.error("[billing] failed to update business credits", bizError.message);
+      }
+    }
   }
 
   const updated = data as BillingAccountRow;
@@ -520,17 +662,24 @@ export async function consumeCredits(
 /** Monthly credit spend for a calendar year (Jan–Dec). Missing months are 0. */
 export async function getMonthlyCreditUsage(
   userId: string,
-  year: number
+  year: number,
+  businessId?: string | null
 ): Promise<number[]> {
   const start = new Date(Date.UTC(year, 0, 1)).toISOString();
   const end = new Date(Date.UTC(year + 1, 0, 1)).toISOString();
 
-  const { data, error } = await supabaseAdmin
+  let query = supabaseAdmin
     .from("billing_credit_events")
     .select("amount, created_at")
     .eq("user_id", userId)
     .gte("created_at", start)
     .lt("created_at", end);
+
+  if (businessId) {
+    query = query.eq("business_id", businessId);
+  }
+
+  const { data, error } = await query;
 
   if (error) throw new Error(error.message);
 

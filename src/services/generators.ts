@@ -1,11 +1,20 @@
 import type { AiPrefs } from "./settings";
 import { itemCountForLength } from "./aiPrefs";
 import { generateTextForUser } from "./aiProvider";
+import {
+  buildPlatformCopyTabs,
+  summarizeCopyStats,
+  type PersonaCopyContext,
+} from "./campaignCopy";
 
 type PersonaLite = {
   id: string;
   name: string;
   demographics?: { label: string; value: string }[];
+  psychographics?: PersonaCopyContext["psychographics"];
+  pain_points?: PersonaCopyContext["pain_points"];
+  goals?: PersonaCopyContext["goals"];
+  buying_triggers?: PersonaCopyContext["buying_triggers"];
 };
 
 function score(base: number, offset: number) {
@@ -211,60 +220,42 @@ export async function buildCampaignPayload(
   persona: PersonaLite,
   name?: string,
   durationDays?: number,
-  aiPrefs?: AiPrefs
+  aiPrefs?: AiPrefs,
+  channels?: string[] | null
 ) {
   const brand = persona.name || "Brand";
   const campaignName = name?.trim() || `${brand} – New Launch Campaign`;
-  const tone = toneKey(aiPrefs?.contentTone ?? "");
-  const length = aiPrefs?.contentLength ?? "";
 
-  const headlineN = itemCountForLength(length, 2, 4, 6);
-  const ctaN = itemCountForLength(length, 2, 4, 6);
-  const emotionalN = itemCountForLength(length, 2, 3, 5);
-  const logicalN = itemCountForLength(length, 2, 3, 5);
-
-  let headlines = headlineBank(brand, tone).slice(0, headlineN);
-  let ctas = ctaBank(tone).slice(0, ctaN);
-  let emotional = emotionalBank(tone).slice(0, emotionalN);
-  let logical = logicalBank(tone).slice(0, logicalN);
+  let tabs = buildPlatformCopyTabs({
+    persona: persona as PersonaCopyContext,
+    channels,
+    aiPrefs,
+  });
 
   const language = aiPrefs?.preferredLanguage ?? "";
   if (language.trim() && !/^english$/i.test(language.trim())) {
-    const translated = await translateTexts(userId, [...headlines, ...ctas, ...emotional, ...logical], language);
+    const flat = tabs.flatMap((tab) => tab.items.map((item) => item.text));
+    const translated = await translateTexts(userId, flat, language);
     let cursor = 0;
-    headlines = translated.slice(cursor, (cursor += headlines.length));
-    ctas = translated.slice(cursor, (cursor += ctas.length));
-    emotional = translated.slice(cursor, (cursor += emotional.length));
-    logical = translated.slice(cursor, (cursor += logical.length));
+    tabs = tabs.map((tab) => ({
+      ...tab,
+      items: tab.items.map((item) => {
+        const text = translated[cursor++] ?? item.text;
+        return {
+          ...item,
+          text,
+          charCount: text.length,
+          withinLimit: text.length <= item.charLimit,
+          feedback:
+            text.length <= item.charLimit
+              ? `${text.length}/${item.charLimit} · within ${tab.label} ${item.format} limit`
+              : `${text.length}/${item.charLimit} · over ${tab.label} ${item.format} limit by ${text.length - item.charLimit}. Shorten to ${item.charLimit} characters.`,
+        };
+      }),
+    }));
   }
 
-  const tabs = [
-    {
-      label: "Headlines",
-      prefix: "Headline",
-      items: headlines.map((text, i) => ({ text, score: score(94, i * 2) })),
-    },
-    {
-      label: "CTA Variations",
-      prefix: "CTA",
-      items: ctas.map((text, i) => ({ text, score: score(92, i * 2) })),
-    },
-    {
-      label: "Emotional Copy",
-      prefix: "Emotional",
-      items: emotional.map((text, i) => ({ text, score: score(90, i * 3) })),
-    },
-    {
-      label: "Logical Copy",
-      prefix: "Logical",
-      items: logical.map((text, i) => ({ text, score: score(91, i * 3) })),
-    },
-  ];
-
-  const headlineCount = tabs[0].items.length;
-  const ctaVariations = tabs[1].items.length;
-  const emotionalAngles = tabs[2].items.length;
-  const totalVariations = tabs.reduce((sum, tab) => sum + tab.items.length, 0);
+  const stats = summarizeCopyStats(tabs);
 
   return {
     name: campaignName,
@@ -274,12 +265,15 @@ export async function buildCampaignPayload(
     duration: durationDays ?? null,
     conversions: { total: 0, rate: 0 },
     stats: {
-      totalVariations,
-      headlines: headlineCount,
-      ctaVariations,
-      emotionalAngles,
-      readingScore: 90,
-      readingScoreLabel: "Excellent",
+      totalVariations: stats.totalVariations,
+      headlines: stats.headlines,
+      ctaVariations: stats.ctaVariations,
+      emotionalAngles: stats.emotionalAngles,
+      readingScore: stats.readingScore,
+      readingScoreLabel: stats.readingScoreLabel,
+      platforms: stats.platforms,
+      targetChannels: channels ?? [],
+      invalidCount: stats.invalidCount,
     },
     tabs,
   };

@@ -1,7 +1,8 @@
 import { Router } from "express";
 import multer from "multer";
 import { supabaseAdmin } from "../config/supabase";
-import { authenticateToken, type AuthRequest } from "../middleware/auth";
+import { authenticateToken } from "../middleware/auth";
+import { attachBusinessContext, type BusinessAuthRequest } from "../middleware/businessContext";
 import { asyncHandler } from "../middleware/errorHandler";
 import { createAssetSchema, updateAssetSchema } from "../schemas/asset.schema";
 
@@ -70,7 +71,8 @@ function extensionFromMime(mime: string, originalName: string): string {
 router.get(
   "/",
   authenticateToken,
-  asyncHandler(async (req: AuthRequest, res) => {
+  attachBusinessContext,
+  asyncHandler(async (req: BusinessAuthRequest, res) => {
     const page = Math.max(1, parseInt(String(req.query.page ?? "1"), 10) || 1);
     const limit = Math.min(100, Math.max(1, parseInt(String(req.query.limit ?? "12"), 10) || 12));
     const search = typeof req.query.search === "string" ? req.query.search.trim() : "";
@@ -82,7 +84,7 @@ router.get(
     let query = supabaseAdmin
       .from("assets")
       .select("*", { count: "exact" })
-      .eq("user_id", req.user!.id);
+      .eq("user_id", req.user!.id).eq("business_id", req.businessId!);
 
     if (type && type !== "all") {
       query = query.eq("type", type);
@@ -113,7 +115,8 @@ router.get(
 router.post(
   "/",
   authenticateToken,
-  asyncHandler(async (req: AuthRequest, res) => {
+  attachBusinessContext,
+  asyncHandler(async (req: BusinessAuthRequest, res) => {
     const parsed = createAssetSchema.safeParse(req.body);
     if (!parsed.success) {
       return res.status(400).json({ success: false, message: "Invalid asset payload" });
@@ -124,6 +127,7 @@ router.post(
       .from("assets")
       .insert({
         user_id: req.user!.id,
+        business_id: req.businessId,
         type: input.type,
         title: input.title,
         campaign_id: input.campaignId ?? null,
@@ -148,8 +152,9 @@ router.post(
 router.post(
   "/upload",
   authenticateToken,
+  attachBusinessContext,
   assetUpload.single("file"),
-  asyncHandler(async (req: AuthRequest, res) => {
+  asyncHandler(async (req: BusinessAuthRequest, res) => {
     const file = req.file;
     if (!file) {
       return res.status(400).json({ success: false, message: "A file is required" });
@@ -181,6 +186,7 @@ router.post(
       .from("assets")
       .insert({
         user_id: req.user!.id,
+        business_id: req.businessId,
         type,
         title,
         campaign_name: campaignName,
@@ -204,7 +210,8 @@ router.post(
 router.patch(
   "/:id",
   authenticateToken,
-  asyncHandler(async (req: AuthRequest, res) => {
+  attachBusinessContext,
+  asyncHandler(async (req: BusinessAuthRequest, res) => {
     const parsed = updateAssetSchema.safeParse(req.body);
     if (!parsed.success) {
       return res.status(400).json({ success: false, message: "Invalid asset payload" });
@@ -222,7 +229,7 @@ router.patch(
     const { data, error } = await supabaseAdmin
       .from("assets")
       .update(updates)
-      .eq("user_id", req.user!.id)
+      .eq("user_id", req.user!.id).eq("business_id", req.businessId!)
       .eq("id", String(req.params.id))
       .select("*")
       .maybeSingle();
@@ -237,11 +244,12 @@ router.patch(
 router.delete(
   "/:id",
   authenticateToken,
-  asyncHandler(async (req: AuthRequest, res) => {
+  attachBusinessContext,
+  asyncHandler(async (req: BusinessAuthRequest, res) => {
     const { data, error } = await supabaseAdmin
       .from("assets")
       .delete()
-      .eq("user_id", req.user!.id)
+      .eq("user_id", req.user!.id).eq("business_id", req.businessId!)
       .eq("id", String(req.params.id))
       .select("id")
       .maybeSingle();

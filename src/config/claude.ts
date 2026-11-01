@@ -11,6 +11,6 @@ if (!apiKey) {
 
 export const claude = new Anthropic({ apiKey: apiKey || "missing-api-key" });
 
-export const CLAUDE_PRO_MODEL = process.env.CLAUDE_PRO_MODEL || "claude-3-5-sonnet-latest";
+export const CLAUDE_PRO_MODEL = process.env.CLAUDE_PRO_MODEL || "claude-sonnet-4-5";
 export const CLAUDE_SCALE_MODEL = process.env.CLAUDE_SCALE_MODEL || CLAUDE_PRO_MODEL;
 

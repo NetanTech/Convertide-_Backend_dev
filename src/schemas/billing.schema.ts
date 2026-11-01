@@ -7,6 +7,8 @@ export const changePlanSchema = z.object({
   planId: z.enum(["free", "pro", "enterprise", "scale"]),
   /** Optional checkout processor. Nigerians may choose stripe or paystack when both are on. */
   provider: z.enum(["stripe", "paystack"]).optional(),
+  /** monthly (default) or yearly — yearly bills 10 months (2 months free). */
+  interval: z.enum(["monthly", "yearly"]).optional(),
 });
 
 export const addPaymentMethodSchema = z.object({
