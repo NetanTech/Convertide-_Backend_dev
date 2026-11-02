@@ -19,7 +19,9 @@ type IntegrationRow = {
   connected_at: string;
 };
 
-const PROVIDERS: IntegrationProvider[] = ["instagram", "facebook", "tiktok", "linkedin"];
+/** Active Connect providers. TikTok OAuth paused until App Review / sandbox is ready. */
+const PROVIDERS: IntegrationProvider[] = ["instagram", "facebook", "linkedin"];
+// Re-enable later: include "tiktok" again and restore TIKTOK_* OAuth below.
 
 function backendPublicUrl() {
   return (process.env.BACKEND_PUBLIC_URL || `http://localhost:${process.env.PORT || 4210}`).replace(/\/$/, "");
@@ -67,6 +69,9 @@ export function verifyOAuthState(state: string): { userId: string; provider: Int
 }
 
 export function isProviderConfigured(provider: IntegrationProvider): boolean {
+  // TikTok Connect paused (even with TIKTOK_* env / demo mode).
+  if (provider === "tiktok") return false;
+
   if (process.env.INTEGRATIONS_DEMO_MODE === "true" || process.env.INTEGRATIONS_DEMO_MODE === "1") {
     return true;
   }
@@ -77,8 +82,6 @@ export function isProviderConfigured(provider: IntegrationProvider): boolean {
       return Boolean(process.env.META_APP_ID?.trim() && process.env.META_APP_SECRET?.trim());
     case "linkedin":
       return Boolean(process.env.LINKEDIN_CLIENT_ID?.trim() && process.env.LINKEDIN_CLIENT_SECRET?.trim());
-    case "tiktok":
-      return Boolean(process.env.TIKTOK_CLIENT_KEY?.trim() && process.env.TIKTOK_CLIENT_SECRET?.trim());
     default:
       return false;
   }
@@ -223,15 +226,16 @@ export function buildAuthorizeUrl(userId: string, provider: IntegrationProvider)
     return `https://www.linkedin.com/oauth/v2/authorization?${params}`;
   }
 
-  // tiktok
-  const params = new URLSearchParams({
-    client_key: process.env.TIKTOK_CLIENT_KEY!.trim(),
-    redirect_uri: callbackUrl("tiktok"),
-    response_type: "code",
-    scope: "user.info.basic,video.publish,video.upload",
-    state,
-  });
-  return `https://www.tiktok.com/v2/auth/authorize/?${params}`;
+  // TikTok Connect paused.
+  // const params = new URLSearchParams({
+  //   client_key: process.env.TIKTOK_CLIENT_KEY!.trim(),
+  //   redirect_uri: callbackUrl("tiktok"),
+  //   response_type: "code",
+  //   scope: "user.info.basic,video.publish,video.upload",
+  //   state,
+  // });
+  // return `https://www.tiktok.com/v2/auth/authorize/?${params}`;
+  throw new Error("TikTok Connect is temporarily disabled.");
 }
 
 function hasRealCredentials(provider: IntegrationProvider) {
@@ -252,6 +256,10 @@ export async function connectDemo(userId: string, provider: IntegrationProvider)
   if (!isDemoMode()) {
     throw new Error("Demo connect is disabled. Set INTEGRATIONS_DEMO_MODE=true or configure OAuth.");
   }
+  if (provider === "tiktok") {
+    throw new Error("TikTok Connect is temporarily disabled.");
+  }
+
   const labels: Record<IntegrationProvider, string> = {
     instagram: "Instagram (demo)",
     facebook: "Facebook (demo)",
@@ -274,7 +282,8 @@ export async function handleOAuthCallback(provider: IntegrationProvider, code: s
   } else if (provider === "linkedin") {
     await exchangeLinkedInCode(userId, code);
   } else if (provider === "tiktok") {
-    await exchangeTikTokCode(userId, code);
+    // await exchangeTikTokCode(userId, code);
+    throw new Error("TikTok Connect is temporarily disabled.");
   }
 
   return { userId, provider };
@@ -468,42 +477,43 @@ async function exchangeLinkedInCode(userId: string, code: string) {
   });
 }
 
-async function exchangeTikTokCode(userId: string, code: string) {
-  const tokenRes = await fetch("https://open.tiktokapis.com/v2/oauth/token/", {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      client_key: process.env.TIKTOK_CLIENT_KEY!.trim(),
-      client_secret: process.env.TIKTOK_CLIENT_SECRET!.trim(),
-      code,
-      grant_type: "authorization_code",
-      redirect_uri: callbackUrl("tiktok"),
-    }),
-  });
-  const tokenJson = (await tokenRes.json()) as {
-    access_token?: string;
-    refresh_token?: string;
-    expires_in?: number;
-    open_id?: string;
-    error_description?: string;
-    error?: string;
-  };
-  if (!tokenRes.ok || !tokenJson.access_token) {
-    throw new Error(tokenJson.error_description || tokenJson.error || "TikTok token exchange failed");
-  }
-
-  await upsertConnectedIntegration({
-    userId,
-    provider: "tiktok",
-    accountName: "TikTok account",
-    accountId: tokenJson.open_id || "",
-    accessToken: tokenJson.access_token,
-    refreshToken: tokenJson.refresh_token || null,
-    tokenExpiresAt: tokenJson.expires_in
-      ? new Date(Date.now() + tokenJson.expires_in * 1000).toISOString()
-      : null,
-  });
-}
+// TikTok Connect paused — restore when App Review / sandbox is ready.
+// async function exchangeTikTokCode(userId: string, code: string) {
+//   const tokenRes = await fetch("https://open.tiktokapis.com/v2/oauth/token/", {
+//     method: "POST",
+//     headers: { "Content-Type": "application/x-www-form-urlencoded" },
+//     body: new URLSearchParams({
+//       client_key: process.env.TIKTOK_CLIENT_KEY!.trim(),
+//       client_secret: process.env.TIKTOK_CLIENT_SECRET!.trim(),
+//       code,
+//       grant_type: "authorization_code",
+//       redirect_uri: callbackUrl("tiktok"),
+//     }),
+//   });
+//   const tokenJson = (await tokenRes.json()) as {
+//     access_token?: string;
+//     refresh_token?: string;
+//     expires_in?: number;
+//     open_id?: string;
+//     error_description?: string;
+//     error?: string;
+//   };
+//   if (!tokenRes.ok || !tokenJson.access_token) {
+//     throw new Error(tokenJson.error_description || tokenJson.error || "TikTok token exchange failed");
+//   }
+//
+//   await upsertConnectedIntegration({
+//     userId,
+//     provider: "tiktok",
+//     accountName: "TikTok account",
+//     accountId: tokenJson.open_id || "",
+//     accessToken: tokenJson.access_token,
+//     refreshToken: tokenJson.refresh_token || null,
+//     tokenExpiresAt: tokenJson.expires_in
+//       ? new Date(Date.now() + tokenJson.expires_in * 1000).toISOString()
+//       : null,
+//   });
+// }
 
 export function frontendIntegrationsRedirect(query: Record<string, string>) {
   const params = new URLSearchParams({ tab: "integrations", ...query });
