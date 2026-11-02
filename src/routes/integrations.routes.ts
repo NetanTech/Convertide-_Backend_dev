@@ -15,7 +15,8 @@ import {
 
 const router = Router();
 
-const PROVIDERS = new Set<IntegrationProvider>(["instagram", "facebook", "tiktok", "linkedin"]);
+/** TikTok omitted while Connect is paused. */
+const PROVIDERS = new Set<IntegrationProvider>(["instagram", "facebook", "linkedin"]);
 
 function parseProvider(value: string): IntegrationProvider | null {
   return PROVIDERS.has(value as IntegrationProvider) ? (value as IntegrationProvider) : null;
