@@ -23,7 +23,7 @@ import {
   verifyTotpEnrollment,
 } from "../services/mfa";
 import { logAccountAudit } from "../services/accountAudit";
-import { sendAuthCodeEmail } from "../services/authEmail";
+import { sendPasswordResetCodeEmail } from "../services/authEmail";
 
 const router = Router();
 
@@ -178,14 +178,11 @@ router.post(
       return res.status(400).json({ success: false, message: "A valid email is required" });
     }
 
-    // Deliver via Zepto HTTP API (Supabase SMTP currently fails to send).
-    const result = await sendAuthCodeEmail(String(email), "signup");
-    if (!result.sent) {
-      // Fall back to Supabase mailer in case generateLink can't be used (e.g. already confirmed).
-      const { error } = await supabase.auth.resend({ type: "signup", email });
-      if (error) {
-        return res.status(400).json({ success: false, message: error.message });
-      }
+    const { error } = await supabase.auth.resend({ type: "signup", email });
+
+    if (error) {
+      console.error("[auth] resend-verification failed:", error.message);
+      return res.status(400).json({ success: false, message: error.message });
     }
 
     return res.json({ success: true, message: "Verification code resent" });
@@ -941,17 +938,10 @@ router.post(
     }
 
     // Never reveal whether the email exists - always respond with success.
-    // Supabase SMTP is broken ("Error sending recovery email"); send OTP via Zepto instead.
-    const result = await sendAuthCodeEmail(String(email), "recovery");
+    // Supabase SMTP fails with "Error sending recovery email"; send OTP via Zepto HTTP.
+    const result = await sendPasswordResetCodeEmail(String(email));
     if (!result.sent) {
       console.warn("[auth] forgot-password Zepto path failed:", result.reason);
-      // Last resort: Supabase mailer (often fails; keep anti-enumeration response).
-      const { error } = await supabase.auth.resetPasswordForEmail(String(email), {
-        redirectTo: undefined,
-      });
-      if (error) {
-        console.error("[auth] resetPasswordForEmail also failed:", error.message);
-      }
     }
 
     return res.json({
