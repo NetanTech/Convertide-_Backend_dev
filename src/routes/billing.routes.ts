@@ -104,6 +104,7 @@ router.get(
 
     const billing = {
       plan: {
+        id: account.plan_id,
         name: account.plan_name,
         price: getTierCatalog()[account.plan_id as PlanTierId]?.price ?? account.plan_price,
         cycle: account.plan_cycle,

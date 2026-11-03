@@ -1,6 +1,6 @@
 import type { AiPrefs } from "./settings";
 
-export type AdPlatform = "meta" | "google" | "linkedin" | "tiktok";
+export type AdPlatform = "meta" | "google" | "linkedin" | "tiktok" | "email";
 
 export type CopyAngle = "headline" | "cta" | "emotional" | "logical";
 
@@ -51,6 +51,7 @@ export const PLATFORM_LIMITS: Record<
   google: { headline: 30, description: 90, cta: 20 },
   linkedin: { hook: 150, long: 600, cta: 30, headline: 70 },
   tiktok: { hook: 100, short: 150, cta: 30 },
+  email: { headline: 60, short: 90, long: 500, cta: 40 },
 };
 
 const PLATFORM_LABELS: Record<AdPlatform, string> = {
@@ -58,6 +59,7 @@ const PLATFORM_LABELS: Record<AdPlatform, string> = {
   google: "Google",
   linkedin: "LinkedIn",
   tiktok: "TikTok",
+  email: "Email",
 };
 
 const MIN_VARIATIONS_PER_PLATFORM = 15;
@@ -72,10 +74,6 @@ function toneKey(contentTone: string): ToneKey {
   if (t === "conversational") return "conversational";
   if (t === "luxury") return "luxury";
   return "default";
-}
-
-function score(base: number, offset: number) {
-  return Math.max(70, Math.min(98, base - offset));
 }
 
 function listText(value: unknown): string {
@@ -100,11 +98,111 @@ function demoValue(persona: PersonaCopyContext, labelPart: string, fallback: str
   return hit?.value?.trim() || fallback;
 }
 
-function clipToLimit(text: string, limit: number): string {
+function endsWithEllipsis(text: string): boolean {
+  return /(?:\.\.\.|…|\u2026)\s*$/u.test(text.trim());
+}
+
+/**
+ * Fit copy to a platform limit without faking compliance.
+ * Soft word-boundary trim is allowed (no ellipsis). If it still will not fit,
+ * keep the full line and mark it over limit in validateItem.
+ */
+function fitCopyToLimit(text: string, limit: number): { text: string; overLimit: boolean } {
   const trimmed = text.trim().replace(/\s+/g, " ");
-  if (trimmed.length <= limit) return trimmed;
-  const sliced = trimmed.slice(0, Math.max(0, limit - 1)).trimEnd();
-  return sliced.replace(/[,:;.\-–—\s]+$/u, "") + "…";
+  if (!trimmed) return { text: "", overLimit: false };
+  if (trimmed.length <= limit) return { text: trimmed, overLimit: false };
+
+  let candidate = trimmed.slice(0, limit).trimEnd();
+  const lastSpace = candidate.lastIndexOf(" ");
+  if (lastSpace >= Math.floor(limit * 0.55)) {
+    candidate = candidate.slice(0, lastSpace).trimEnd();
+  }
+  candidate = candidate.replace(/[,:;.\-–—\s]+$/u, "");
+
+  if (candidate.length > 0 && candidate.length <= limit && !endsWithEllipsis(candidate)) {
+    return { text: candidate, overLimit: false };
+  }
+
+  return { text: trimmed, overLimit: true };
+}
+
+/** Stable, non-staircase score from copy quality signals (not index-1 countdown). */
+function scoreVariation(input: {
+  text: string;
+  withinLimit: boolean;
+  format: CopyFormat;
+  angle: CopyAngle;
+  charLimit: number;
+  index: number;
+}): number {
+  let s = 76;
+  const ratio = input.charLimit > 0 ? input.text.length / input.charLimit : 1;
+
+  if (ratio >= 0.35 && ratio <= 0.88) s += 9;
+  else if (ratio > 0.88 && ratio <= 1) s += 4;
+  else if (ratio < 0.2) s -= 5;
+  else if (ratio > 1) s -= 14;
+
+  if (input.withinLimit) s += 7;
+  else s -= 10;
+
+  if (input.format === "cta") s += 2;
+  else if (input.format === "headline" || input.format === "hook") s += 3;
+  if (input.angle === "logical") s += 2;
+  else if (input.angle === "emotional") s += 1;
+
+  let hash = 2166136261;
+  for (let i = 0; i < input.text.length; i += 1) {
+    hash ^= input.text.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  // Spread -4..+8 so neighboring rows are not exact 1-point steps.
+  s += (hash % 13) - 4;
+  s -= Math.floor(input.index / 8);
+
+  return Math.max(64, Math.min(96, Math.round(s)));
+}
+
+/** Phrases used as internal tone guidance — never show these as ad copy. */
+const TONE_CUE_PHRASES = [
+  "clear and direct",
+  "precise and credible",
+  "warm and approachable",
+  "confident and urgent",
+  "natural and human",
+  "refined and selective",
+] as const;
+
+const INSTRUCTION_LEAK_RE =
+  /\b(content tone|write in a|user ai preferences|follow these|prompt|instruction text|return valid json|system:|assistant:)\b/i;
+
+/**
+ * True when copy looks like prompt/tone guidance rather than publishable ad text.
+ * Used to drop leaked instruction lines before save.
+ */
+export function isInstructionLeak(text: string): boolean {
+  const t = text.trim();
+  if (!t) return true;
+  if (INSTRUCTION_LEAK_RE.test(t)) return true;
+  const lower = t.toLowerCase();
+  for (const phrase of TONE_CUE_PHRASES) {
+    if (lower.includes(phrase)) return true;
+  }
+  // Meta-instructions about writing style / platform copy, not ads.
+  if (/\b(linkedin|meta|google|tiktok)\s+copy\b/i.test(t)) return true;
+  if (/\b(creative|narratives?|angles?)\s+that\b/i.test(t) && /\b(speaks to|sounds|focus)/i.test(t)) {
+    return true;
+  }
+  if (/^[A-Z]+\s+angle\s*:/i.test(t)) return true;
+  if (/^(tone|style|voice)\s*:/i.test(t)) return true;
+  return false;
+}
+
+/** Drop instruction leaks; empty string if nothing usable remains. */
+export function sanitizeVariationText(text: string): string {
+  let next = text.trim().replace(/\s+/g, " ");
+  if (!next || isInstructionLeak(next)) return "";
+  return next;
 }
 
 function validateItem(
@@ -113,20 +211,39 @@ function validateItem(
   format: CopyFormat,
   personaId: string,
   angle: CopyAngle,
-  scoreValue: number
-): CampaignCopyItem {
+  index: number
+): CampaignCopyItem | null {
+  const cleaned = sanitizeVariationText(text);
+  if (!cleaned) return null;
+
   const charLimit = PLATFORM_LIMITS[platform][format] ?? 125;
-  const safe = clipToLimit(text, charLimit);
-  const charCount = safe.length;
-  const withinLimit = charCount <= charLimit;
+  const fitted = fitCopyToLimit(cleaned, charLimit);
+  if (!fitted.text || isInstructionLeak(fitted.text)) return null;
+
+  // Ellipsis-truncated lines are never "within limit" even if charCount == limit.
+  const looksTruncated = endsWithEllipsis(fitted.text);
+  const charCount = fitted.text.length;
+  const withinLimit = !fitted.overLimit && !looksTruncated && charCount <= charLimit;
   const platformLabel = PLATFORM_LABELS[platform];
-  const feedback = withinLimit
-    ? `${charCount}/${charLimit} · within ${platformLabel} ${format} limit`
-    : `${charCount}/${charLimit} · over ${platformLabel} ${format} limit by ${charCount - charLimit}. Shorten to ${charLimit} characters.`;
+  let feedback: string;
+  if (withinLimit) {
+    feedback = `${charCount}/${charLimit} · within ${platformLabel} ${format} limit`;
+  } else if (looksTruncated) {
+    feedback = `${charCount}/${charLimit} · truncated for ${platformLabel} ${format}. Rewrite to fit ${charLimit} characters without cutting off.`;
+  } else {
+    feedback = `${charCount}/${charLimit} · over ${platformLabel} ${format} limit by ${Math.max(0, charCount - charLimit)}. Shorten to ${charLimit} characters.`;
+  }
 
   return {
-    text: safe,
-    score: scoreValue,
+    text: fitted.text,
+    score: scoreVariation({
+      text: fitted.text,
+      withinLimit,
+      format,
+      angle,
+      charLimit,
+      index,
+    }),
     platform,
     personaId,
     format,
@@ -148,18 +265,23 @@ export function resolveAdPlatforms(channels?: string[] | null): AdPlatform[] {
     google: "google",
     linkedin: "linkedin",
     tiktok: "tiktok",
+    "email marketing": "email",
+    email: "email",
   };
 
+  // No channel list → generate the full set (legacy / draft without selection).
+  if (!channels || channels.length === 0) {
+    return ["meta", "google", "linkedin", "tiktok", "email"];
+  }
+
   const resolved = new Set<AdPlatform>();
-  for (const raw of channels ?? []) {
+  for (const raw of channels) {
     const key = raw.trim().toLowerCase();
     const platform = map[key];
     if (platform) resolved.add(platform);
   }
 
-  if (resolved.size === 0) {
-    return ["meta", "google", "linkedin", "tiktok"];
-  }
+  // Respect the wizard selection. Never invent Meta/Google when they were not chosen.
   return Array.from(resolved);
 }
 
@@ -169,7 +291,7 @@ function uniquePush(target: string[], value: string) {
   if (!target.some((t) => t.toLowerCase() === v.toLowerCase())) target.push(v);
 }
 
-function buildPersonaSeeds(persona: PersonaCopyContext, tone: ToneKey) {
+function buildPersonaSeeds(persona: PersonaCopyContext) {
   const brand = persona.name || "Brand";
   const audience = demoValue(persona, "age", "your buyers");
   const location = demoValue(persona, "location", "your market");
@@ -189,16 +311,7 @@ function buildPersonaSeeds(persona: PersonaCopyContext, tone: ToneKey) {
     "fast setup",
   ]);
 
-  const toneCue: Record<ToneKey, string> = {
-    default: "clear and direct",
-    professional: "precise and credible",
-    friendly: "warm and approachable",
-    bold: "confident and urgent",
-    conversational: "natural and human",
-    luxury: "refined and selective",
-  };
-
-  return { brand, audience, location, pains, goals, triggers, toneCue: toneCue[tone] };
+  return { brand, audience, location, pains, goals, triggers };
 }
 
 function padToMinimum(texts: string[], factories: Array<() => string>, minimum: number): string[] {
@@ -217,20 +330,20 @@ function metaVariations(seeds: ReturnType<typeof buildPersonaSeeds>, tone: ToneK
   format: CopyFormat;
   angle: CopyAngle;
 }> {
-  const { brand, audience, location, pains, goals, triggers, toneCue } = seeds;
+  const { brand, audience, location, pains, goals, triggers } = seeds;
   const rows: Array<{ text: string; format: CopyFormat; angle: CopyAngle }> = [];
 
   const shorts = [
-    `${brand} helps ${audience} in ${location} skip ${pains[0]} with ${toneCue} ads.`,
-    `Tired of ${pains[0]}? ${brand} turns persona insight into Meta-ready copy.`,
+    `${brand} helps ${audience} in ${location} skip ${pains[0]} and hit ${goals[0]}.`,
+    `Tired of ${pains[0]}? ${brand} turns persona insight into ads that convert.`,
     `Reach ${audience} with ${brand} — built around ${goals[0]}.`,
-    `${brand}: ${toneCue} creative that speaks to ${triggers[0]}.`,
-    `Stop guessing on Meta. ${brand} matches copy to ${audience}.`,
+    `${brand} leans into ${triggers[0]} so ${audience} actually stop scrolling.`,
+    `Stop guessing on Meta. ${brand} matches messaging to ${audience}.`,
   ];
   shorts.forEach((text, i) => rows.push({ text, format: "short", angle: i % 2 === 0 ? "emotional" : "logical" }));
 
   const longs = [
-    `${brand} was shaped for ${audience} in ${location}. If ${pains[0]} is slowing growth, our ${toneCue} Meta angles focus on ${goals[0]} and lean into ${triggers[0]} — so every scroll feels relevant.`,
+    `${brand} was shaped for ${audience} in ${location}. If ${pains[0]} is slowing growth, we focus on ${goals[0]} and lean into ${triggers[0]} — so every scroll feels relevant.`,
     `Meta rewards clarity. ${brand} pairs short hooks with longer proof for ${audience}, addressing ${pains[1] ?? pains[0]} while pointing to ${goals[1] ?? goals[0]}.`,
     `From awareness to click, ${brand} keeps ${audience} moving. We open with ${triggers[0]}, acknowledge ${pains[0]}, and close on ${goals[0]} without sounding generic.`,
   ];
@@ -303,14 +416,14 @@ function linkedinVariations(seeds: ReturnType<typeof buildPersonaSeeds>, tone: T
   format: CopyFormat;
   angle: CopyAngle;
 }> {
-  const { brand, audience, location, pains, goals, triggers, toneCue } = seeds;
+  const { brand, audience, location, pains, goals, triggers } = seeds;
   const rows: Array<{ text: string; format: CopyFormat; angle: CopyAngle }> = [];
 
   const hooks = [
     `${brand} for leaders who refuse ${pains[0]}.`,
     `If ${audience} in ${location} need ${goals[0]}, start here.`,
     `Professional buyers respond to ${triggers[0]} — ${brand} leads with it.`,
-    `${toneCue} LinkedIn copy that still sounds human.`,
+    `${brand} keeps the message human while staying specific to ${audience}.`,
     `Stop broadcasting. Start conversations with ${brand}.`,
     `A practical path from ${pains[0]} to ${goals[0]}.`,
     `${brand}: persona-backed messaging for B2B feeds.`,
@@ -321,7 +434,7 @@ function linkedinVariations(seeds: ReturnType<typeof buildPersonaSeeds>, tone: T
   );
 
   const longs = [
-    `${brand} helps teams serving ${audience} replace generic LinkedIn posts with ${toneCue} narratives. We open on ${triggers[0]}, name ${pains[0]}, and show a credible path to ${goals[0]}.`,
+    `${brand} helps teams serving ${audience} replace generic LinkedIn posts with specific narratives. We open on ${triggers[0]}, name ${pains[0]}, and show a credible path to ${goals[0]}.`,
     `In ${location}, attention is scarce. ${brand} keeps LinkedIn creative specific: who it's for, why now, and what happens next — without the buzzword fog.`,
   ];
   longs.forEach((text) => rows.push({ text, format: "long", angle: "logical" }));
@@ -380,8 +493,54 @@ function tiktokVariations(seeds: ReturnType<typeof buildPersonaSeeds>, tone: Ton
   return rows;
 }
 
+function emailVariations(seeds: ReturnType<typeof buildPersonaSeeds>, tone: ToneKey): Array<{
+  text: string;
+  format: CopyFormat;
+  angle: CopyAngle;
+}> {
+  const { brand, audience, location, pains, goals, triggers } = seeds;
+  const rows: Array<{ text: string; format: CopyFormat; angle: CopyAngle }> = [];
+
+  const subjects = [
+    `${brand}: a clearer path to ${goals[0]}`,
+    `Still dealing with ${pains[0]}?`,
+    `${audience} in ${location} are switching to ${brand}`,
+    `Quick win: ${triggers[0]} → ${goals[0]}`,
+    `${brand} for ${audience} who want results`,
+    `Don't let ${pains[0]} stall this week`,
+    tone === "bold" ? `${brand}. Built for ${goals[0]}.` : `Something useful for ${audience}`,
+    `Your ${goals[0]} plan starts here`,
+  ];
+  subjects.forEach((text) => rows.push({ text, format: "headline", angle: "headline" }));
+
+  const previews = [
+    `See how ${brand} helps ${audience} move past ${pains[0]}.`,
+    `Open for a short take on ${goals[0]} and ${triggers[0]}.`,
+    `Practical next steps for ${audience} in ${location}.`,
+    `${brand} keeps the message specific, not generic.`,
+  ];
+  previews.forEach((text) => rows.push({ text, format: "short", angle: "logical" }));
+
+  const bodies = [
+    `Hi there — if ${pains[0]} is slowing ${audience} down, ${brand} focuses on ${goals[0]} with messaging built around ${triggers[0]}. Here's a simple next step you can try this week.`,
+    `${brand} was shaped for ${audience} in ${location}. We open with ${triggers[0]}, acknowledge ${pains[0]}, and point clearly to ${goals[0]} without the fluff.`,
+    `Most teams guess at email copy. ${brand} starts from persona insight so ${audience} hear something that matches how they decide.`,
+  ];
+  bodies.forEach((text) => rows.push({ text, format: "long", angle: "emotional" }));
+
+  const ctas = [
+    tone === "professional" ? "Read the brief" : "See how it works",
+    "Get the plan",
+    "Try it free",
+    "Reply to this email",
+  ];
+  ctas.forEach((text) => rows.push({ text, format: "cta", angle: "cta" }));
+
+  return rows;
+}
+
 function factoriesForPlatform(
-  platform: AdPlatform,
+  _platform: AdPlatform,
   seeds: ReturnType<typeof buildPersonaSeeds>
 ): Array<() => string> {
   const { brand, audience, pains, goals, triggers, location } = seeds;
@@ -391,7 +550,7 @@ function factoriesForPlatform(
     () => `${triggers[0]} → ${goals[0]}`,
     () => `${brand} in ${location}`,
     () => `Made for ${audience}`,
-    () => `${platform.toUpperCase()} angle: ${goals[1] ?? goals[0]}`,
+    () => `${brand} helps ${audience} reach ${goals[1] ?? goals[0]}`,
     () => `Why ${audience} pick ${brand}`,
     () => `From ${pains[1] ?? pains[0]} to clarity`,
   ];
@@ -407,7 +566,7 @@ export function buildPlatformCopyTabs(input: {
   aiPrefs?: AiPrefs | null;
 }): CampaignCopyTab[] {
   const tone = toneKey(input.aiPrefs?.contentTone ?? "");
-  const seeds = buildPersonaSeeds(input.persona, tone);
+  const seeds = buildPersonaSeeds(input.persona);
   const platforms = resolveAdPlatforms(input.channels);
   const personaId = input.persona.id;
 
@@ -419,40 +578,45 @@ export function buildPlatformCopyTabs(input: {
     google: () => googleVariations(seeds),
     linkedin: () => linkedinVariations(seeds, tone),
     tiktok: () => tiktokVariations(seeds, tone),
+    email: () => emailVariations(seeds, tone),
   };
 
   return platforms.map((platform) => {
-    const raw = builders[platform]();
+    const raw = builders[platform]().filter((row) => !isInstructionLeak(row.text));
     const texts = padToMinimum(
-      raw.map((r) => r.text),
+      raw.map((r) => r.text).filter((t) => Boolean(sanitizeVariationText(t))),
       factoriesForPlatform(platform, seeds),
       MIN_VARIATIONS_PER_PLATFORM
-    );
+    ).filter((t) => Boolean(sanitizeVariationText(t)));
 
-    const items: CampaignCopyItem[] = texts.map((text, i) => {
-      const template = raw[i % raw.length];
+    const items: CampaignCopyItem[] = [];
+    for (let i = 0; i < texts.length; i += 1) {
+      const template = raw[i % Math.max(raw.length, 1)];
       const format = template?.format ?? (platform === "google" ? "headline" : "short");
       const angle = template?.angle ?? "logical";
-      return validateItem(text, platform, format, personaId, angle, score(94, i));
-    });
+      const item = validateItem(texts[i], platform, format, personaId, angle, i);
+      if (item) items.push(item);
+    }
 
-    // Guarantee minimum after validation/clipping uniqueness
-    while (items.length < MIN_VARIATIONS_PER_PLATFORM) {
+    // Guarantee minimum after stripping instruction leaks / limit fitting
+    let guard = 0;
+    while (items.length < MIN_VARIATIONS_PER_PLATFORM && guard < MIN_VARIATIONS_PER_PLATFORM * 4) {
       const i = items.length;
-      const filler = clipToLimit(
-        `${seeds.brand} · ${seeds.goals[i % seeds.goals.length]} for ${seeds.audience}`,
-        PLATFORM_LIMITS[platform].headline ?? PLATFORM_LIMITS[platform].short ?? 125
+      const fillerSource =
+        factoriesForPlatform(platform, seeds)[guard % 8]?.() ??
+        `${seeds.brand} · ${seeds.goals[i % seeds.goals.length]} for ${seeds.audience}`;
+      const item = validateItem(
+        fillerSource,
+        platform,
+        platform === "tiktok" ? "hook" : "headline",
+        personaId,
+        "headline",
+        i
       );
-      items.push(
-        validateItem(
-          filler,
-          platform,
-          platform === "tiktok" ? "hook" : "headline",
-          personaId,
-          "headline",
-          score(88, i)
-        )
-      );
+      if (item && !items.some((existing) => existing.text.toLowerCase() === item.text.toLowerCase())) {
+        items.push(item);
+      }
+      guard += 1;
     }
 
     return {

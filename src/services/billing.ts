@@ -67,25 +67,37 @@ const TIER_CATALOG: Record<
     apiPriority: string;
   }
 > = {
+  // Feature strings must stay aligned with frontend `PLAN_FEATURES` in src/lib/pricing.ts.
   free: {
     name: "Free",
-    description: "Get started with core AI marketing tools.",
+    description: "Generate personas and complete campaigns with Gemini AI (standard quality).",
     price: "Free",
     cycle: "mo",
     monthlyUsd: null,
-    features: ["500 AI Credits / mo", "1 Persona", "Basic campaign copy"],
-    creditsTotal: 500,
+    features: [
+      "1,500 AI Credits / mo",
+      "1 Persona",
+      "Campaign & plan generation",
+      "Gemini AI (standard quality)",
+    ],
+    // Enough for ~2 full persona → campaign → plan loops (600 credits each).
+    creditsTotal: 1500,
     seatsLimit: 1,
     projects: "1 active",
     apiPriority: "Standard",
   },
   pro: {
     name: "Pro",
-    description: "For growing teams running multiple campaigns.",
+    description: "More capacity with higher-quality Claude AI.",
     price: "$49",
     cycle: "mo",
     monthlyUsd: 49,
-    features: ["5,000 AI Credits / mo", "5 Personas", "Email support"],
+    features: [
+      "5,000 AI Credits / mo",
+      "5 Personas",
+      "Claude AI (higher quality)",
+      "Email support",
+    ],
     creditsTotal: 5000,
     seatsLimit: 5,
     projects: "Unlimited",
@@ -97,7 +109,12 @@ const TIER_CATALOG: Record<
     price: "$79",
     cycle: "mo",
     monthlyUsd: 79,
-    features: ["15,000 AI Credits / mo", "Unlimited personas", "Priority support"],
+    features: [
+      "15,000 AI Credits / mo",
+      "Unlimited personas",
+      "Claude AI (highest quality)",
+      "Priority support",
+    ],
     creditsTotal: 15000,
     seatsLimit: 10,
     projects: "Unlimited",
@@ -242,7 +259,29 @@ async function loadOrCreateBillingAccount(userId: string): Promise<BillingAccoun
   if (error) throw new Error(error.message);
   if (data) {
     const raw = data as BillingAccountRow & { plan_id: string };
-    return { ...raw, plan_id: normalizePlanId(raw.plan_id) };
+    const planId = normalizePlanId(raw.plan_id);
+    const account = { ...raw, plan_id: planId };
+    // Keep Free pools aligned with catalog so persona → campaign → plan fits, still below paid.
+    const freePool = TIER_CATALOG.free.creditsTotal ?? 0;
+    if (planId === "free" && freePool > 0 && account.credits_total !== freePool) {
+      const { data: updated, error: updateError } = await supabaseAdmin
+        .from("billing_accounts")
+        .update({
+          credits_total: freePool,
+          credits_used: Math.min(account.credits_used, freePool),
+          projects: TIER_CATALOG.free.projects,
+          plan_name: TIER_CATALOG.free.name,
+          plan_price: TIER_CATALOG.free.price,
+          plan_cycle: TIER_CATALOG.free.cycle,
+        })
+        .eq("user_id", userId)
+        .select("*")
+        .single();
+      if (!updateError && updated) {
+        return { ...(updated as BillingAccountRow), plan_id: "free" };
+      }
+    }
+    return account;
   }
 
   const renewsOn = new Date();
