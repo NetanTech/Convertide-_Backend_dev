@@ -23,6 +23,7 @@ import {
   verifyTotpEnrollment,
 } from "../services/mfa";
 import { logAccountAudit } from "../services/accountAudit";
+import { sendEmailChangeCodeEmail, sendPasswordResetCodeEmail } from "../services/authEmail";
 
 const router = Router();
 
@@ -180,6 +181,7 @@ router.post(
     const { error } = await supabase.auth.resend({ type: "signup", email });
 
     if (error) {
+      console.error("[auth] resend-verification failed:", error.message);
       return res.status(400).json({ success: false, message: error.message });
     }
 
@@ -822,6 +824,197 @@ router.delete(
   })
 );
 
+// POST /api/auth/change-email — verify password, then email a code to the new address
+router.post(
+  "/change-email",
+  authenticateToken,
+  asyncHandler(async (req: AuthRequest, res) => {
+    const userId = req.user?.id;
+    const currentEmail = req.user?.email;
+    const newEmail = typeof req.body?.newEmail === "string" ? req.body.newEmail.trim().toLowerCase() : "";
+    const currentPassword =
+      typeof req.body?.currentPassword === "string" ? req.body.currentPassword : "";
+
+    if (!userId || !currentEmail) {
+      return res.status(401).json({ success: false, message: "Unauthorized" });
+    }
+    if (!isValidEmail(newEmail)) {
+      return res.status(400).json({ success: false, message: "Enter a valid new email address" });
+    }
+    if (newEmail === currentEmail.trim().toLowerCase()) {
+      return res.status(400).json({
+        success: false,
+        message: "New email must be different from your current email",
+      });
+    }
+    if (!currentPassword) {
+      return res.status(400).json({ success: false, message: "Current password is required" });
+    }
+
+    const { data: verifyData, error: verifyError } = await supabase.auth.signInWithPassword({
+      email: currentEmail,
+      password: currentPassword,
+    });
+
+    if (verifyError) {
+      await logAccountAudit({
+        userId,
+        action: "email_change_denied",
+        actor: "user",
+        metadata: { reason: "current_password_incorrect" },
+      });
+      return res.status(400).json({ success: false, message: "Current password is incorrect" });
+    }
+
+    if (verifyData.session?.access_token) {
+      await supabaseAdmin.auth.admin.signOut(verifyData.session.access_token, "local");
+    }
+
+    const taken = await emailHasAccount(newEmail);
+    if (taken === true) {
+      return res.status(400).json({
+        success: false,
+        message: "That email is already associated with an account",
+      });
+    }
+
+    const sent = await sendEmailChangeCodeEmail(currentEmail, newEmail);
+    if (!sent.sent) {
+      await logAccountAudit({
+        userId,
+        action: "email_change_request_failed",
+        actor: "user",
+        metadata: { reason: sent.reason ?? "send_failed", newEmail },
+      });
+      return res.status(400).json({
+        success: false,
+        message: "We couldn't send a verification code to that email. Please try again.",
+      });
+    }
+
+    await logAccountAudit({
+      userId,
+      action: "email_change_requested",
+      actor: "user",
+      metadata: { newEmail },
+    });
+
+    return res.json({
+      success: true,
+      message: "Verification code sent to your new email",
+      data: { pendingEmail: newEmail },
+    });
+  })
+);
+
+// POST /api/auth/change-email/confirm — apply email change after OTP on the new address
+router.post(
+  "/change-email/confirm",
+  authenticateToken,
+  asyncHandler(async (req: AuthRequest, res) => {
+    const userId = req.user?.id;
+    const newEmail = typeof req.body?.newEmail === "string" ? req.body.newEmail.trim().toLowerCase() : "";
+    const token = typeof req.body?.token === "string" ? req.body.token.trim() : "";
+
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "Unauthorized" });
+    }
+    if (!isValidEmail(newEmail) || !token) {
+      return res.status(400).json({
+        success: false,
+        message: "New email and verification code are required",
+      });
+    }
+
+    const { data, error } = await supabaseAuthForRequest(req).auth.verifyOtp({
+      email: newEmail,
+      token,
+      type: "email_change",
+    });
+
+    if (error || !data.user) {
+      await logAccountAudit({
+        userId,
+        action: "email_change_confirm_failed",
+        actor: "user",
+        metadata: { reason: error?.message ?? "invalid_code", newEmail },
+      });
+      return res.status(400).json({
+        success: false,
+        message: error?.message || "Invalid or expired verification code",
+      });
+    }
+
+    // Prefer the verified session user; fall back to a fresh admin read.
+    let user = data.user;
+    if (!user.email || user.email.toLowerCase() !== newEmail) {
+      const { data: refreshed, error: refreshError } = await supabaseAdmin.auth.admin.getUserById(userId);
+      if (refreshError || !refreshed.user) {
+        return res.status(400).json({
+          success: false,
+          message: "Email was verified but we couldn't refresh your account. Sign in again.",
+        });
+      }
+      user = refreshed.user;
+    }
+
+    if (data.session?.access_token && user.id) {
+      await rememberSessionDevice(user.id, data.session.access_token, req);
+    }
+
+    await logAccountAudit({
+      userId,
+      action: "email_changed",
+      actor: "user",
+      metadata: { newEmail: user.email ?? newEmail },
+    });
+
+    return res.json({
+      success: true,
+      message: "Email updated",
+      data: await sessionResponse(data.session, user),
+    });
+  })
+);
+
+// POST /api/auth/change-email/resend — resend OTP to the pending new address (password not required again)
+router.post(
+  "/change-email/resend",
+  authenticateToken,
+  asyncHandler(async (req: AuthRequest, res) => {
+    const userId = req.user?.id;
+    const currentEmail = req.user?.email;
+    const newEmail = typeof req.body?.newEmail === "string" ? req.body.newEmail.trim().toLowerCase() : "";
+
+    if (!userId || !currentEmail) {
+      return res.status(401).json({ success: false, message: "Unauthorized" });
+    }
+    if (!isValidEmail(newEmail)) {
+      return res.status(400).json({ success: false, message: "Enter a valid new email address" });
+    }
+    if (newEmail === currentEmail.trim().toLowerCase()) {
+      return res.status(400).json({
+        success: false,
+        message: "New email must be different from your current email",
+      });
+    }
+
+    const sent = await sendEmailChangeCodeEmail(currentEmail, newEmail);
+    if (!sent.sent) {
+      return res.status(400).json({
+        success: false,
+        message: "We couldn't resend the verification code. Please try again.",
+      });
+    }
+
+    return res.json({
+      success: true,
+      message: "Verification code resent",
+      data: { pendingEmail: newEmail },
+    });
+  })
+);
+
 // POST /api/auth/change-password
 router.post(
   "/change-password",
@@ -936,7 +1129,11 @@ router.post(
     }
 
     // Never reveal whether the email exists - always respond with success.
-    await supabase.auth.resetPasswordForEmail(email);
+    // Supabase SMTP fails with "Error sending recovery email"; send OTP via Zepto HTTP.
+    const result = await sendPasswordResetCodeEmail(String(email));
+    if (!result.sent) {
+      console.warn("[auth] forgot-password Zepto path failed:", result.reason);
+    }
 
     return res.json({
       success: true,

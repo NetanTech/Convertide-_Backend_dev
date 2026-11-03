@@ -3,6 +3,8 @@ import { itemCountForLength } from "./aiPrefs";
 import { generateTextForUser } from "./aiProvider";
 import {
   buildPlatformCopyTabs,
+  isInstructionLeak,
+  sanitizeVariationText,
   summarizeCopyStats,
   type PersonaCopyContext,
 } from "./campaignCopy";
@@ -239,19 +241,26 @@ export async function buildCampaignPayload(
     let cursor = 0;
     tabs = tabs.map((tab) => ({
       ...tab,
-      items: tab.items.map((item) => {
-        const text = translated[cursor++] ?? item.text;
-        return {
-          ...item,
-          text,
-          charCount: text.length,
-          withinLimit: text.length <= item.charLimit,
-          feedback:
-            text.length <= item.charLimit
+      items: tab.items
+        .map((item) => {
+          const raw = translated[cursor++] ?? item.text;
+          const text = sanitizeVariationText(raw) || item.text;
+          if (isInstructionLeak(text)) return null;
+          const truncated = /(?:\.\.\.|…|\u2026)\s*$/u.test(text);
+          const withinLimit = !truncated && text.length <= item.charLimit;
+          return {
+            ...item,
+            text,
+            charCount: text.length,
+            withinLimit,
+            feedback: withinLimit
               ? `${text.length}/${item.charLimit} · within ${tab.label} ${item.format} limit`
-              : `${text.length}/${item.charLimit} · over ${tab.label} ${item.format} limit by ${text.length - item.charLimit}. Shorten to ${item.charLimit} characters.`,
-        };
-      }),
+              : truncated
+                ? `${text.length}/${item.charLimit} · truncated for ${tab.label} ${item.format}. Rewrite to fit ${item.charLimit} characters without cutting off.`
+                : `${text.length}/${item.charLimit} · over ${tab.label} ${item.format} limit by ${Math.max(0, text.length - item.charLimit)}. Shorten to ${item.charLimit} characters.`,
+          };
+        })
+        .filter((item): item is NonNullable<typeof item> => item !== null),
     }));
   }
 
