@@ -10,13 +10,14 @@ import {
   isDemoMode,
   isProviderConfigured,
   listIntegrations,
+  sanitizeReturnTo,
+  verifyOAuthState,
   type IntegrationProvider,
 } from "../services/integrations";
 
 const router = Router();
 
-/** TikTok omitted while Connect is paused. */
-const PROVIDERS = new Set<IntegrationProvider>(["instagram", "facebook", "linkedin"]);
+const PROVIDERS = new Set<IntegrationProvider>(["instagram", "facebook", "tiktok", "linkedin"]);
 
 function parseProvider(value: string): IntegrationProvider | null {
   return PROVIDERS.has(value as IntegrationProvider) ? (value as IntegrationProvider) : null;
@@ -56,14 +57,16 @@ router.post(
       });
     }
 
+    const returnTo = sanitizeReturnTo(req.body?.returnTo);
+
     try {
-      const authUrl = buildAuthorizeUrl(req.user!.id, provider);
+      const authUrl = buildAuthorizeUrl(req.user!.id, provider, returnTo);
       return res.json({ success: true, data: { authUrl } });
     } catch (err) {
       const message = err instanceof Error ? err.message : "Could not start connect";
       if (message === "DEMO_CONNECT" || isDemoMode()) {
         await connectDemo(req.user!.id, provider);
-        return res.json({ success: true, data: { connected: true, demo: true } });
+        return res.json({ success: true, data: { connected: true, demo: true, returnTo } });
       }
       return res.status(400).json({ success: false, message });
     }
@@ -93,27 +96,43 @@ router.get(
     const state = typeof req.query.state === "string" ? req.query.state : "";
     const oauthError = typeof req.query.error === "string" ? req.query.error : "";
 
+    let returnTo: string | null = null;
+    try {
+      if (state) returnTo = verifyOAuthState(state).returnTo;
+    } catch {
+      // Invalid state — fall back to Settings.
+    }
+
     if (!provider) {
-      return res.redirect(frontendIntegrationsRedirect({ error: "unknown_provider" }));
+      return res.redirect(frontendIntegrationsRedirect({ error: "unknown_provider" }, returnTo));
     }
     if (oauthError) {
-      return res.redirect(frontendIntegrationsRedirect({ error: oauthError, provider }));
+      return res.redirect(
+        frontendIntegrationsRedirect({ error: oauthError, provider }, returnTo)
+      );
     }
     if (!code || !state) {
-      return res.redirect(frontendIntegrationsRedirect({ error: "missing_code", provider }));
+      return res.redirect(
+        frontendIntegrationsRedirect({ error: "missing_code", provider }, returnTo)
+      );
     }
 
     try {
-      await handleOAuthCallback(provider, code, state);
-      return res.redirect(frontendIntegrationsRedirect({ connected: provider }));
+      const result = await handleOAuthCallback(provider, code, state);
+      return res.redirect(
+        frontendIntegrationsRedirect({ connected: provider }, result.returnTo)
+      );
     } catch (err) {
       const message = err instanceof Error ? err.message : "connect_failed";
       return res.redirect(
-        frontendIntegrationsRedirect({
-          error: "connect_failed",
-          provider,
-          detail: message.slice(0, 120),
-        })
+        frontendIntegrationsRedirect(
+          {
+            error: "connect_failed",
+            provider,
+            detail: message.slice(0, 280),
+          },
+          returnTo
+        )
       );
     }
   })
