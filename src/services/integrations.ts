@@ -19,9 +19,7 @@ type IntegrationRow = {
   connected_at: string;
 };
 
-/** Active Connect providers. TikTok OAuth paused until App Review / sandbox is ready. */
-const PROVIDERS: IntegrationProvider[] = ["instagram", "facebook", "linkedin"];
-// Re-enable later: include "tiktok" again and restore TIKTOK_* OAuth below.
+const PROVIDERS: IntegrationProvider[] = ["instagram", "facebook", "tiktok", "linkedin"];
 
 function backendPublicUrl() {
   return (process.env.BACKEND_PUBLIC_URL || `http://localhost:${process.env.PORT || 4210}`).replace(/\/$/, "");
@@ -35,16 +33,40 @@ function oauthStateSecret() {
   );
 }
 
-export function signOAuthState(payload: { userId: string; provider: IntegrationProvider }) {
+/** Same-app relative path only (blocks open redirects). */
+export function sanitizeReturnTo(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (!trimmed.startsWith("/") || trimmed.startsWith("//") || trimmed.includes("://")) {
+    return null;
+  }
+  if (trimmed.length > 512) return null;
+  return trimmed;
+}
+
+export function signOAuthState(payload: {
+  userId: string;
+  provider: IntegrationProvider;
+  returnTo?: string | null;
+}) {
   const body = Buffer.from(
-    JSON.stringify({ ...payload, exp: Date.now() + 10 * 60 * 1000 }),
+    JSON.stringify({
+      userId: payload.userId,
+      provider: payload.provider,
+      returnTo: sanitizeReturnTo(payload.returnTo) || undefined,
+      exp: Date.now() + 10 * 60 * 1000,
+    }),
     "utf8"
   ).toString("base64url");
   const sig = crypto.createHmac("sha256", oauthStateSecret()).update(body).digest("base64url");
   return `${body}.${sig}`;
 }
 
-export function verifyOAuthState(state: string): { userId: string; provider: IntegrationProvider } {
+export function verifyOAuthState(state: string): {
+  userId: string;
+  provider: IntegrationProvider;
+  returnTo: string | null;
+} {
   const [body, sig] = state.split(".");
   if (!body || !sig) throw new Error("Invalid OAuth state");
   const expected = crypto.createHmac("sha256", oauthStateSecret()).update(body).digest("base64url");
@@ -57,6 +79,7 @@ export function verifyOAuthState(state: string): { userId: string; provider: Int
   const parsed = JSON.parse(Buffer.from(body, "base64url").toString("utf8")) as {
     userId?: string;
     provider?: IntegrationProvider;
+    returnTo?: string;
     exp?: number;
   };
   if (!parsed.userId || !parsed.provider || !PROVIDERS.includes(parsed.provider)) {
@@ -65,13 +88,14 @@ export function verifyOAuthState(state: string): { userId: string; provider: Int
   if (!parsed.exp || parsed.exp < Date.now()) {
     throw new Error("OAuth state expired — try connecting again");
   }
-  return { userId: parsed.userId, provider: parsed.provider };
+  return {
+    userId: parsed.userId,
+    provider: parsed.provider,
+    returnTo: sanitizeReturnTo(parsed.returnTo),
+  };
 }
 
 export function isProviderConfigured(provider: IntegrationProvider): boolean {
-  // TikTok Connect paused (even with TIKTOK_* env / demo mode).
-  if (provider === "tiktok") return false;
-
   if (process.env.INTEGRATIONS_DEMO_MODE === "true" || process.env.INTEGRATIONS_DEMO_MODE === "1") {
     return true;
   }
@@ -82,6 +106,8 @@ export function isProviderConfigured(provider: IntegrationProvider): boolean {
       return Boolean(process.env.META_APP_ID?.trim() && process.env.META_APP_SECRET?.trim());
     case "linkedin":
       return Boolean(process.env.LINKEDIN_CLIENT_ID?.trim() && process.env.LINKEDIN_CLIENT_SECRET?.trim());
+    case "tiktok":
+      return Boolean(process.env.TIKTOK_CLIENT_KEY?.trim() && process.env.TIKTOK_CLIENT_SECRET?.trim());
     default:
       return false;
   }
@@ -173,7 +199,11 @@ function callbackUrl(provider: IntegrationProvider) {
   return `${backendPublicUrl()}/api/integrations/callback/${provider}`;
 }
 
-export function buildAuthorizeUrl(userId: string, provider: IntegrationProvider): string {
+export function buildAuthorizeUrl(
+  userId: string,
+  provider: IntegrationProvider,
+  returnTo?: string | null
+): string {
   if (!isProviderConfigured(provider)) {
     throw new Error(`${provider} is not configured. Add provider credentials to the backend .env.`);
   }
@@ -183,7 +213,7 @@ export function buildAuthorizeUrl(userId: string, provider: IntegrationProvider)
     throw new Error("DEMO_CONNECT");
   }
 
-  const state = signOAuthState({ userId, provider });
+  const state = signOAuthState({ userId, provider, returnTo });
 
   if (provider === "facebook" || provider === "instagram") {
     const appId = process.env.META_APP_ID!.trim();
@@ -199,6 +229,8 @@ export function buildAuthorizeUrl(userId: string, provider: IntegrationProvider)
       redirect_uri: callbackUrl(provider),
       state,
       response_type: "code",
+      // Ask again for declined Page permissions on reconnect.
+      auth_type: "rerequest",
     });
 
     if (configId) {
@@ -226,16 +258,18 @@ export function buildAuthorizeUrl(userId: string, provider: IntegrationProvider)
     return `https://www.linkedin.com/oauth/v2/authorization?${params}`;
   }
 
-  // TikTok Connect paused.
-  // const params = new URLSearchParams({
-  //   client_key: process.env.TIKTOK_CLIENT_KEY!.trim(),
-  //   redirect_uri: callbackUrl("tiktok"),
-  //   response_type: "code",
-  //   scope: "user.info.basic,video.publish,video.upload",
-  //   state,
-  // });
-  // return `https://www.tiktok.com/v2/auth/authorize/?${params}`;
-  throw new Error("TikTok Connect is temporarily disabled.");
+  if (provider === "tiktok") {
+    const params = new URLSearchParams({
+      client_key: process.env.TIKTOK_CLIENT_KEY!.trim(),
+      redirect_uri: callbackUrl("tiktok"),
+      response_type: "code",
+      scope: "user.info.basic,video.publish,video.upload",
+      state,
+    });
+    return `https://www.tiktok.com/v2/auth/authorize/?${params}`;
+  }
+
+  throw new Error(`Unsupported integration provider: ${provider}`);
 }
 
 function hasRealCredentials(provider: IntegrationProvider) {
@@ -256,9 +290,6 @@ export async function connectDemo(userId: string, provider: IntegrationProvider)
   if (!isDemoMode()) {
     throw new Error("Demo connect is disabled. Set INTEGRATIONS_DEMO_MODE=true or configure OAuth.");
   }
-  if (provider === "tiktok") {
-    throw new Error("TikTok Connect is temporarily disabled.");
-  }
 
   const labels: Record<IntegrationProvider, string> = {
     instagram: "Instagram (demo)",
@@ -275,18 +306,17 @@ export async function connectDemo(userId: string, provider: IntegrationProvider)
 }
 
 export async function handleOAuthCallback(provider: IntegrationProvider, code: string, state: string) {
-  const { userId } = verifyOAuthState(state);
+  const { userId, returnTo } = verifyOAuthState(state);
 
   if (provider === "facebook" || provider === "instagram") {
     await exchangeMetaCode(userId, provider, code);
   } else if (provider === "linkedin") {
     await exchangeLinkedInCode(userId, code);
   } else if (provider === "tiktok") {
-    // await exchangeTikTokCode(userId, code);
-    throw new Error("TikTok Connect is temporarily disabled.");
+    await exchangeTikTokCode(userId, code);
   }
 
-  return { userId, provider };
+  return { userId, provider, returnTo };
 }
 
 type MetaPageAccount = {
@@ -308,6 +338,148 @@ export type MetaPublishMetadata = {
 };
 
 const META_GRAPH = "https://graph.facebook.com/v21.0";
+const META_PAGE_FIELDS =
+  "id,name,access_token,tasks,instagram_business_account{id,username}";
+
+async function metaGet<T>(path: string, userToken: string): Promise<T> {
+  const url = path.startsWith("http")
+    ? path
+    : `${META_GRAPH}${path}${path.includes("?") ? "&" : "?"}access_token=${encodeURIComponent(userToken)}`;
+  const res = await fetch(url);
+  const json = (await res.json()) as T & { error?: { message?: string } };
+  if (!res.ok) {
+    throw new Error(json.error?.message || `Meta Graph request failed (${res.status})`);
+  }
+  return json;
+}
+
+async function hydratePageToken(
+  page: MetaPageAccount,
+  userToken: string
+): Promise<MetaPageAccount | null> {
+  if (!page.id) return null;
+  if (page.access_token) return page;
+  try {
+    const hydrated = await metaGet<MetaPageAccount>(
+      `/${page.id}?fields=${META_PAGE_FIELDS}`,
+      userToken
+    );
+    if (hydrated.id && hydrated.access_token) return { ...page, ...hydrated };
+  } catch {
+    // ignore and treat as unusable
+  }
+  return null;
+}
+
+/**
+ * Facebook Login for Business sometimes returns Pages via /me/accounts,
+ * nested accounts, or Business Manager owned/client pages. Try all paths.
+ */
+async function listMetaPages(userToken: string, userId?: string): Promise<MetaPageAccount[]> {
+  const byId = new Map<string, MetaPageAccount>();
+
+  function addPages(pages: MetaPageAccount[] | undefined) {
+    for (const page of pages ?? []) {
+      if (!page.id) continue;
+      const prev = byId.get(page.id);
+      byId.set(page.id, { ...prev, ...page });
+    }
+  }
+
+  try {
+    let next: string | null =
+      `/me/accounts?fields=${META_PAGE_FIELDS}&limit=100`;
+    for (let i = 0; i < 5 && next; i += 1) {
+      const page = await metaGet<{
+        data?: MetaPageAccount[];
+        paging?: { next?: string };
+      }>(next, userToken);
+      addPages(page.data);
+      next = page.paging?.next || null;
+    }
+  } catch {
+    // continue with fallbacks
+  }
+
+  if (byId.size === 0) {
+    try {
+      const nested = await metaGet<{ accounts?: { data?: MetaPageAccount[] } }>(
+        `/me?fields=accounts{${META_PAGE_FIELDS}}`,
+        userToken
+      );
+      addPages(nested.accounts?.data);
+    } catch {
+      // continue
+    }
+  }
+
+  if (byId.size === 0) {
+    try {
+      const meId = userId || (await metaGet<{ id?: string }>("/me?fields=id", userToken)).id;
+      if (meId) {
+        const accounts = await metaGet<{ data?: MetaPageAccount[] }>(
+          `/${meId}/accounts?fields=${META_PAGE_FIELDS}&limit=100`,
+          userToken
+        );
+        addPages(accounts.data);
+      }
+    } catch {
+      // continue
+    }
+  }
+
+  if (byId.size === 0) {
+    try {
+      const businesses = await metaGet<{ data?: Array<{ id?: string }> }>(
+        `/me/businesses?fields=id,name&limit=50`,
+        userToken
+      );
+      for (const business of businesses.data ?? []) {
+        if (!business.id) continue;
+        for (const edge of ["owned_pages", "client_pages"] as const) {
+          try {
+            const pages = await metaGet<{ data?: MetaPageAccount[] }>(
+              `/${business.id}/${edge}?fields=${META_PAGE_FIELDS}&limit=100`,
+              userToken
+            );
+            addPages(pages.data);
+          } catch {
+            // Business edge may be unavailable for this token.
+          }
+        }
+      }
+    } catch {
+      // no business access
+    }
+  }
+
+  const hydrated: MetaPageAccount[] = [];
+  for (const page of byId.values()) {
+    const ready = await hydratePageToken(page, userToken);
+    if (ready?.id && ready.access_token) hydrated.push(ready);
+  }
+  return hydrated;
+}
+
+async function describeMissingPages(userToken: string): Promise<string> {
+  try {
+    const perms = await metaGet<{
+      data?: Array<{ permission?: string; status?: string }>;
+    }>("/me/permissions", userToken);
+    const granted = (perms.data ?? [])
+      .filter((p) => p.status === "granted")
+      .map((p) => p.permission)
+      .filter(Boolean);
+    const needed = ["pages_show_list", "pages_manage_posts", "pages_read_engagement"];
+    const missing = needed.filter((p) => !granted.includes(p));
+    if (missing.length || granted.length === 0) {
+      return " Choose your Page, allow all Page permissions, and keep clicking Continue until you return. If it still fails, open Facebook → Settings → Business integrations, remove Convert Tide, then Connect again.";
+    }
+  } catch {
+    // ignore
+  }
+  return " Choose your Page (not only your profile), allow Page access, and finish every Continue step until you return here.";
+}
 
 async function exchangeMetaCode(userId: string, provider: IntegrationProvider, code: string) {
   const appId = process.env.META_APP_ID!.trim();
@@ -348,37 +520,18 @@ async function exchangeMetaCode(userId: string, provider: IntegrationProvider, c
     // Keep short-lived token if exchange fails.
   }
 
-  const meRes = await fetch(
-    `${META_GRAPH}/me?fields=id,name&access_token=${encodeURIComponent(userToken)}`
-  );
-  const me = (await meRes.json()) as { id?: string; name?: string };
-
-  const pagesRes = await fetch(
-    `${META_GRAPH}/me/accounts?fields=id,name,access_token,tasks,instagram_business_account{id,username}&access_token=${encodeURIComponent(userToken)}`
-  );
-  const pagesJson = (await pagesRes.json()) as {
-    data?: MetaPageAccount[];
-    error?: { message?: string };
-  };
-  if (!pagesRes.ok) {
-    throw new Error(
-      pagesJson.error?.message ||
-        "Could not list Facebook Pages. Grant Page access during Connect and try again."
-    );
-  }
-
-  const pages = pagesJson.data ?? [];
+  const me = await metaGet<{ id?: string; name?: string }>("/me?fields=id,name", userToken);
+  const pages = await listMetaPages(userToken, me.id);
   const withContent = pages.filter((p) =>
     Array.isArray(p.tasks) ? p.tasks.includes("CREATE_CONTENT") || p.tasks.length === 0 : true
   );
-  const ranked = (withContent.length ? withContent : pages).filter((p) => p.id && p.access_token);
+  const ranked = withContent.length ? withContent : pages;
 
   if (provider === "facebook") {
     const page = ranked[0];
     if (!page?.id || !page.access_token) {
-      throw new Error(
-        "No Facebook Page was shared. Create or select a Page during Connect, then try again."
-      );
+      const hint = await describeMissingPages(userToken);
+      throw new Error(`Could not access your Facebook Page. ${hint}`);
     }
     const ig = page.instagram_business_account;
     const metadata: MetaPublishMetadata = {
@@ -477,45 +630,58 @@ async function exchangeLinkedInCode(userId: string, code: string) {
   });
 }
 
-// TikTok Connect paused — restore when App Review / sandbox is ready.
-// async function exchangeTikTokCode(userId: string, code: string) {
-//   const tokenRes = await fetch("https://open.tiktokapis.com/v2/oauth/token/", {
-//     method: "POST",
-//     headers: { "Content-Type": "application/x-www-form-urlencoded" },
-//     body: new URLSearchParams({
-//       client_key: process.env.TIKTOK_CLIENT_KEY!.trim(),
-//       client_secret: process.env.TIKTOK_CLIENT_SECRET!.trim(),
-//       code,
-//       grant_type: "authorization_code",
-//       redirect_uri: callbackUrl("tiktok"),
-//     }),
-//   });
-//   const tokenJson = (await tokenRes.json()) as {
-//     access_token?: string;
-//     refresh_token?: string;
-//     expires_in?: number;
-//     open_id?: string;
-//     error_description?: string;
-//     error?: string;
-//   };
-//   if (!tokenRes.ok || !tokenJson.access_token) {
-//     throw new Error(tokenJson.error_description || tokenJson.error || "TikTok token exchange failed");
-//   }
-//
-//   await upsertConnectedIntegration({
-//     userId,
-//     provider: "tiktok",
-//     accountName: "TikTok account",
-//     accountId: tokenJson.open_id || "",
-//     accessToken: tokenJson.access_token,
-//     refreshToken: tokenJson.refresh_token || null,
-//     tokenExpiresAt: tokenJson.expires_in
-//       ? new Date(Date.now() + tokenJson.expires_in * 1000).toISOString()
-//       : null,
-//   });
-// }
+async function exchangeTikTokCode(userId: string, code: string) {
+  const tokenRes = await fetch("https://open.tiktokapis.com/v2/oauth/token/", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      client_key: process.env.TIKTOK_CLIENT_KEY!.trim(),
+      client_secret: process.env.TIKTOK_CLIENT_SECRET!.trim(),
+      code,
+      grant_type: "authorization_code",
+      redirect_uri: callbackUrl("tiktok"),
+    }),
+  });
+  const tokenJson = (await tokenRes.json()) as {
+    access_token?: string;
+    refresh_token?: string;
+    expires_in?: number;
+    open_id?: string;
+    error_description?: string;
+    error?: string;
+  };
+  if (!tokenRes.ok || !tokenJson.access_token) {
+    throw new Error(tokenJson.error_description || tokenJson.error || "TikTok token exchange failed");
+  }
 
-export function frontendIntegrationsRedirect(query: Record<string, string>) {
+  await upsertConnectedIntegration({
+    userId,
+    provider: "tiktok",
+    accountName: "TikTok account",
+    accountId: tokenJson.open_id || "",
+    accessToken: tokenJson.access_token,
+    refreshToken: tokenJson.refresh_token || null,
+    tokenExpiresAt: tokenJson.expires_in
+      ? new Date(Date.now() + tokenJson.expires_in * 1000).toISOString()
+      : null,
+  });
+}
+
+export function frontendIntegrationsRedirect(
+  query: Record<string, string>,
+  returnTo?: string | null
+) {
+  const safeReturnTo = sanitizeReturnTo(returnTo);
+  if (safeReturnTo) {
+    const [path, existing = ""] = safeReturnTo.split("?");
+    const params = new URLSearchParams(existing);
+    for (const [key, value] of Object.entries(query)) {
+      if (value) params.set(key, value);
+    }
+    const qs = params.toString();
+    return appUrl(qs ? `${path}?${qs}` : path);
+  }
+
   const params = new URLSearchParams({ tab: "integrations", ...query });
   return appUrl(`/dashboard/settings?${params}`);
 }

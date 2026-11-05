@@ -2,5 +2,6 @@ node_modules
 dist
 .env
 .env.local
+.env.live
 *.log
 .DS_Store

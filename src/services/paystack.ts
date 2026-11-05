@@ -32,6 +32,10 @@ type PaystackApiResult<T> = {
 };
 
 export function isPaystackConfigured() {
+  // Temporary kill switch: set PAYSTACK_ENABLED=false to hide Paystack at checkout
+  // while Convert Tide Live business activation is pending.
+  const enabled = process.env.PAYSTACK_ENABLED?.trim().toLowerCase();
+  if (enabled === "0" || enabled === "false" || enabled === "off") return false;
   return Boolean(process.env.PAYSTACK_SECRET_KEY?.trim());
 }
 
