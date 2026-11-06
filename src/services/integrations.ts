@@ -406,8 +406,10 @@ async function hydratePageToken(
   if (!page.id) return null;
   if (page.access_token) return page;
   try {
+    // `tasks` exists on /me/accounts, not on the Page node. Asking for it here
+    // makes Graph reject the whole request, including the Page token.
     const hydrated = await metaGet<MetaPageAccount>(
-      `/${page.id}?fields=id,name,access_token,tasks`,
+      `/${page.id}?fields=id,name,access_token`,
       userToken
     );
     if (!hydrated.id || !hydrated.access_token) return null;
@@ -507,7 +509,19 @@ async function listMetaPages(userToken: string, userId?: string): Promise<MetaPa
     }
   }
 
-  if (byId.size === 0) {
+  if ([...byId.values()].every((page) => !page.access_token)) {
+    try {
+      const plain = await metaGet<{ data?: MetaPageAccount[] }>(
+        `/me/accounts?fields=id,name,access_token&limit=100`,
+        userToken
+      );
+      addPages(plain.data);
+    } catch {
+      // continue
+    }
+  }
+
+  if ([...byId.values()].every((page) => !page.access_token)) {
     try {
       addPages(await pagesFromGrantedTargets(userToken));
     } catch {
@@ -583,7 +597,11 @@ async function exchangeMetaCode(userId: string, provider: IntegrationProvider, c
   }
 
   const me = await metaGet<{ id?: string; name?: string }>("/me?fields=id,name", userToken);
-  const pages = await listMetaPages(userToken, me.id);
+  let pages = await listMetaPages(userToken, me.id);
+  // A long-lived exchange can drop the Page the person just ticked. The code token still has it.
+  if (pages.length === 0 && tokenJson.access_token !== userToken) {
+    pages = await listMetaPages(tokenJson.access_token, me.id);
+  }
   const withContent = pages.filter((p) =>
     Array.isArray(p.tasks) ? p.tasks.includes("CREATE_CONTENT") || p.tasks.length === 0 : true
   );
