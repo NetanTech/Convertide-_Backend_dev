@@ -690,6 +690,7 @@ export function frontendIntegrationsRedirect(
   if (safeReturnTo) {
     const [path, existing = ""] = safeReturnTo.split("?");
     const params = new URLSearchParams(existing);
+    for (const key of ["connected", "error", "provider", "detail"]) params.delete(key);
     for (const [key, value] of Object.entries(query)) {
       if (value) params.set(key, value);
     }
