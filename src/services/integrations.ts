@@ -195,7 +195,18 @@ export async function upsertConnectedIntegration(input: {
   if (error) throw new Error(error.message);
 }
 
+function tiktokRedirectUri() {
+  const explicit = process.env.TIKTOK_REDIRECT_URI?.trim();
+  if (explicit) return explicit.replace(/\/$/, "");
+  // Sandbox URL prefix is https://converttide.com/. TikTok rejects any other host.
+  if (process.env.NODE_ENV === "production") {
+    return "https://converttide.com/api/integrations/callback/tiktok";
+  }
+  return `${backendPublicUrl()}/api/integrations/callback/tiktok`;
+}
+
 function callbackUrl(provider: IntegrationProvider) {
+  if (provider === "tiktok") return tiktokRedirectUri();
   return `${backendPublicUrl()}/api/integrations/callback/${provider}`;
 }
 
@@ -263,7 +274,9 @@ export function buildAuthorizeUrl(
       client_key: process.env.TIKTOK_CLIENT_KEY!.trim(),
       redirect_uri: callbackUrl("tiktok"),
       response_type: "code",
-      scope: "user.info.basic,video.publish,video.upload",
+      // Login Kit only grants user.info.basic. video.publish and video.upload
+      // belong to Content Posting API, which sandbox does not include.
+      scope: "user.info.basic",
       state,
     });
     return `https://www.tiktok.com/v2/auth/authorize/?${params}`;
