@@ -368,6 +368,37 @@ async function metaGet<T>(path: string, userToken: string): Promise<T> {
   return json;
 }
 
+/**
+ * Login for Business records the Pages the person ticked on the token itself.
+ * /me/accounts is often empty even after they select a Page.
+ */
+async function pagesFromGrantedTargets(userToken: string): Promise<MetaPageAccount[]> {
+  const appId = process.env.META_APP_ID?.trim();
+  const appSecret = process.env.META_APP_SECRET?.trim();
+  if (!appId || !appSecret) return [];
+
+  const debugUrl = new URL(`${META_GRAPH}/debug_token`);
+  debugUrl.searchParams.set("input_token", userToken);
+  debugUrl.searchParams.set("access_token", `${appId}|${appSecret}`);
+
+  const res = await fetch(debugUrl);
+  const json = (await res.json()) as {
+    data?: { granular_scopes?: Array<{ scope?: string; target_ids?: string[] }> };
+    error?: { message?: string };
+  };
+  if (!res.ok) return [];
+
+  const ids = new Set<string>();
+  for (const scope of json.data?.granular_scopes ?? []) {
+    const name = scope.scope ?? "";
+    if (!name.startsWith("pages_")) continue;
+    for (const id of scope.target_ids ?? []) {
+      if (id) ids.add(id);
+    }
+  }
+  return [...ids].map((id) => ({ id }));
+}
+
 async function hydratePageToken(
   page: MetaPageAccount,
   userToken: string
@@ -376,14 +407,22 @@ async function hydratePageToken(
   if (page.access_token) return page;
   try {
     const hydrated = await metaGet<MetaPageAccount>(
-      `/${page.id}?fields=${META_PAGE_FIELDS}`,
+      `/${page.id}?fields=id,name,access_token,tasks`,
       userToken
     );
-    if (hydrated.id && hydrated.access_token) return { ...page, ...hydrated };
+    if (!hydrated.id || !hydrated.access_token) return null;
+    try {
+      const ig = await metaGet<MetaPageAccount>(
+        `/${page.id}?fields=instagram_business_account{id,username}`,
+        userToken
+      );
+      return { ...page, ...hydrated, ...ig };
+    } catch {
+      return { ...page, ...hydrated };
+    }
   } catch {
-    // ignore and treat as unusable
+    return null;
   }
-  return null;
 }
 
 /**
@@ -468,6 +507,14 @@ async function listMetaPages(userToken: string, userId?: string): Promise<MetaPa
     }
   }
 
+  if (byId.size === 0) {
+    try {
+      addPages(await pagesFromGrantedTargets(userToken));
+    } catch {
+      // Token inspection is a fallback, not a hard failure.
+    }
+  }
+
   const hydrated: MetaPageAccount[] = [];
   for (const page of byId.values()) {
     const ready = await hydratePageToken(page, userToken);
@@ -488,12 +535,12 @@ async function describeMissingPages(userToken: string): Promise<string> {
     const needed = ["pages_show_list", "pages_manage_posts", "pages_read_engagement"];
     const missing = needed.filter((p) => !granted.includes(p));
     if (missing.length || granted.length === 0) {
-      return " Choose your Page, allow all Page permissions, and keep clicking Continue until you return. If it still fails, open Facebook → Settings → Business integrations, remove Convert Tide, then Connect again.";
+      return " Facebook linked your profile, but not a Page. In Facebook, open Settings, then Business integrations, remove Convert Tide, and Connect again. Tick your Page, then continue until you return here.";
     }
   } catch {
     // ignore
   }
-  return " Choose your Page (not only your profile), allow Page access, and finish every Continue step until you return here.";
+  return " Facebook linked your profile, but not a Page. Remove Convert Tide under Facebook Settings, then Business integrations, and Connect again.";
 }
 
 async function exchangeMetaCode(userId: string, provider: IntegrationProvider, code: string) {
