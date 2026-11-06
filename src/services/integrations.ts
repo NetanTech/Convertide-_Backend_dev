@@ -198,11 +198,13 @@ export async function upsertConnectedIntegration(input: {
 function tiktokRedirectUri() {
   const explicit = process.env.TIKTOK_REDIRECT_URI?.trim();
   if (explicit) return explicit.replace(/\/$/, "");
-  // Sandbox URL prefix is https://converttide.com/. TikTok rejects any other host.
-  if (process.env.NODE_ENV === "production") {
-    return "https://converttide.com/api/integrations/callback/tiktok";
+  const backend = backendPublicUrl();
+  // TikTok only accepts the verified site. A development NODE_ENV on Render must not
+  // send users back to the Render host.
+  if (/localhost|127\.0\.0\.1/.test(backend)) {
+    return `${backend}/api/integrations/callback/tiktok`;
   }
-  return `${backendPublicUrl()}/api/integrations/callback/tiktok`;
+  return "https://converttide.com/api/integrations/callback/tiktok";
 }
 
 function callbackUrl(provider: IntegrationProvider) {
