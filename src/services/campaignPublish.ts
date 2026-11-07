@@ -760,6 +760,170 @@ export async function executePublish(input: {
   }
 }
 
+/**
+ * Internal publish for scheduled/opt-in weekly jobs (no client preview token).
+ */
+export async function executeDirectPublish(input: {
+  userId: string;
+  businessId: string;
+  campaignId: string;
+  platform: "meta" | "email";
+  campaignName: string;
+  headlines: string[];
+  primaryText: string;
+  recipients?: string[];
+  idempotencyKey: string;
+}): Promise<{ publishId: string; externalId: string; accountName: string | null }> {
+  const emailRecipients =
+    input.platform === "email" ? normalizeEmailRecipients(input.recipients) : [];
+  if (input.platform === "email") {
+    if (!isEmailConfigured()) {
+      throw new Error("Email publishing needs ZeptoMail configured.");
+    }
+    if (emailRecipients.length === 0) {
+      throw new Error("Add at least one valid recipient email before publishing.");
+    }
+  }
+
+  const key = input.idempotencyKey.trim().slice(0, 128);
+  const { data: inserted, error: insertError } = await supabaseAdmin
+    .from("campaign_publishes")
+    .insert({
+      user_id: input.userId,
+      business_id: input.businessId,
+      campaign_id: input.campaignId,
+      platform: input.platform,
+      status: "publishing",
+      account_provider: input.platform === "meta" ? "facebook" : "email",
+      account_name: emailRecipients[0] ?? null,
+      preview: {
+        headlines: input.headlines,
+        primaryText: input.primaryText,
+        mode: "live",
+        scheduled: true,
+      },
+      idempotency_key: key,
+    })
+    .select("*")
+    .single();
+
+  if (insertError || !inserted) {
+    throw new Error(insertError?.message || "Failed to start scheduled publish");
+  }
+
+  const publishId = (inserted as { id: string }).id;
+
+  try {
+    let externalId: string;
+    let accountName: string | null = null;
+
+    if (input.platform === "meta") {
+      const account = await resolveMetaAccount(input.userId);
+      if (!account?.access_token) {
+        throw new Error("Connect a Facebook Page before scheduled Meta posting.");
+      }
+      if (isDemoMode()) {
+        externalId = `meta_demo_sched_${crypto.randomUUID()}`;
+        accountName = account.account_name;
+      } else {
+        const campaignRow = await loadCampaign(input.userId, input.businessId, input.campaignId);
+        const stats = campaignRow.stats || {};
+        const imageUrl =
+          typeof stats.imageUrl === "string"
+            ? stats.imageUrl
+            : typeof stats.image_url === "string"
+              ? stats.image_url
+              : null;
+        const pushed = await pushMetaLive({
+          account,
+          message: [input.campaignName, input.primaryText, ...input.headlines.slice(1)]
+            .filter(Boolean)
+            .join("\n\n"),
+          imageUrl,
+        });
+        externalId = pushed.externalId;
+        accountName = account.account_name;
+      }
+    } else {
+      const mail = buildMarketingEmailHtml({
+        campaignName: input.campaignName,
+        headlines: input.headlines,
+        primaryText: input.primaryText,
+      });
+      let sent = 0;
+      const failed: string[] = [];
+      for (const to of emailRecipients) {
+        const result = await sendEmail({
+          to,
+          subject: mail.subject,
+          html: mail.html,
+          text: mail.text,
+        });
+        if (result.ok) sent += 1;
+        else failed.push(to);
+      }
+      if (sent === 0) {
+        throw new Error(
+          failed.length
+            ? `Email send failed for ${failed.join(", ")}.`
+            : "Email send failed. Check ZeptoMail."
+        );
+      }
+      externalId = `email_zepto_sched_${crypto.randomUUID()}`;
+      accountName =
+        emailRecipients.length === 1
+          ? emailRecipients[0]
+          : `${sent} recipients${failed.length ? ` (${failed.length} failed)` : ""}`;
+    }
+
+    const publishedAt = new Date().toISOString();
+    await supabaseAdmin
+      .from("campaign_publishes")
+      .update({
+        status: "published",
+        external_id: externalId,
+        published_at: publishedAt,
+        updated_at: publishedAt,
+        account_name: accountName,
+        preview: {
+          headlines: input.headlines,
+          primaryText: input.primaryText,
+          mode: "live",
+          scheduled: true,
+          ...(input.platform === "email" ? { recipients: emailRecipients } : {}),
+        },
+      })
+      .eq("id", publishId);
+
+    await logAccountAudit({
+      userId: input.userId,
+      businessId: input.businessId,
+      action: "campaign.publish_scheduled",
+      actor: "system",
+      reference: publishId,
+      metadata: {
+        campaignId: input.campaignId,
+        platform: input.platform,
+        externalId,
+        accountName,
+      },
+    });
+
+    return { publishId, externalId, accountName };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Scheduled publish failed";
+    await supabaseAdmin
+      .from("campaign_publishes")
+      .update({
+        status: "failed",
+        error_message: message.slice(0, 500),
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", publishId);
+    throw err;
+  }
+}
+
 export async function revokePublish(input: {
   userId: string;
   businessId: string;

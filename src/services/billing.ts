@@ -677,6 +677,22 @@ export async function consumeCredits(
   reason: string,
   businessId?: string | null
 ): Promise<BillingAccountRow> {
+  // Platform admins use Convert Tide free: no credit deduction.
+  const { isAdminUserId } = await import("./admin");
+  if (await isAdminUserId(userId)) {
+    const account = await ensureBillingAccount(userId);
+    const { error: eventError } = await supabaseAdmin.from("billing_credit_events").insert({
+      user_id: userId,
+      amount: 0,
+      reason: `${reason}_admin_free`,
+      ...(businessId ? { business_id: businessId } : {}),
+    });
+    if (eventError) {
+      console.error("[billing] failed to record admin credit event", eventError.message);
+    }
+    return account;
+  }
+
   // Optimistic lock + one retry so concurrent generates cannot overspend the plan pool.
   let account = await ensureBillingAccount(userId);
   let updated: BillingAccountRow | null = null;

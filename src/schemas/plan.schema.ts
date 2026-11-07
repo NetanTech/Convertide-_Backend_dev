@@ -42,6 +42,7 @@ export const updatePlanSchema = z.object({
         platform: z.enum(["instagram", "facebook", "email", "tiktok", "other"]),
         label: z.string(),
         format: z.string(),
+        days: z.array(z.string()).min(1).max(7).optional(),
       })
     )
     .optional(),

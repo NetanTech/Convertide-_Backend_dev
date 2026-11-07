@@ -16,10 +16,12 @@ import businessesRoutes from "./routes/businesses.routes";
 import dashboardRoutes from "./routes/dashboard.routes";
 import integrationsRoutes from "./routes/integrations.routes";
 import supportRoutes from "./routes/support.routes";
+import adminRoutes from "./routes/admin.routes";
 import { globalErrorHandler, notFoundHandler, asyncHandler } from "./middleware/errorHandler";
 import { handlePaystackWebhook } from "./services/paystack";
 import { handleStripeWebhook } from "./services/stripe";
 import { startSubscriptionLifecycleScheduler } from "./services/subscriptionLifecycle";
+import { startScheduledPublishScheduler } from "./services/scheduledPublish";
 
 dotenv.config();
 
@@ -88,6 +90,7 @@ app.use("/api/businesses", businessesRoutes);
 app.use("/api/dashboard", dashboardRoutes);
 app.use("/api/integrations", integrationsRoutes);
 app.use("/api/support", supportRoutes);
+app.use("/api/admin", adminRoutes);
 
 app.use(notFoundHandler);
 app.use(globalErrorHandler);
@@ -97,4 +100,5 @@ const PORT = process.env.PORT ? Number(process.env.PORT) : 4210;
 app.listen(PORT, () => {
   console.log(`Convertide API listening on http://localhost:${PORT}`);
   startSubscriptionLifecycleScheduler();
+  startScheduledPublishScheduler();
 });

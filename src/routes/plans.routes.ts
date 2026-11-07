@@ -4,7 +4,7 @@ import { authenticateToken } from "../middleware/auth";
 import { attachBusinessContext, type BusinessAuthRequest } from "../middleware/businessContext";
 import { asyncHandler } from "../middleware/errorHandler";
 import { createPlanSchema, updatePlanSchema } from "../schemas/plan.schema";
-import { buildPlanPayload } from "../services/generators";
+import { buildPlanPayload, normalizeContentCalendar } from "../services/generators";
 import { createNotification } from "../services/notifications";
 import { consumeCredits, CREDIT_COSTS, InsufficientCreditsError } from "../services/billing";
 import { ensureUserSettings } from "../services/settings";
@@ -16,6 +16,12 @@ import {
   savePlanVersion,
   updatesFromPlanSnapshot,
 } from "../services/planVersions";
+import {
+  disableWeeklyPosting,
+  enableWeeklyPosting,
+  getWeeklyPostingStatus,
+  type WeeklyPlatform,
+} from "../services/scheduledPublish";
 
 const router = Router();
 
@@ -55,7 +61,10 @@ function toPlan(row: PlanRow) {
     timeline: row.timeline,
     channelMix: row.channel_mix,
     weeklyActionPlan: row.weekly_action_plan,
-    contentCalendar: row.content_calendar,
+    contentCalendar: normalizeContentCalendar(
+      row.content_calendar,
+      row.persona_snapshot?.name || row.name || row.id
+    ),
     kpis: row.kpis,
     expectedOutcome: row.expected_outcome,
     progress: row.progress ?? 0,
@@ -474,6 +483,78 @@ router.patch(
     if (error) return res.status(500).json({ success: false, message: error.message });
     if (!data) return res.status(404).json({ success: false, message: "Plan not found" });
     return res.json({ success: true, data: { plan: toPlan(data as PlanRow) } });
+  })
+);
+
+// GET /api/plans/:id/weekly-posting
+router.get(
+  "/:id/weekly-posting",
+  authenticateToken,
+  attachBusinessContext,
+  asyncHandler(async (req: BusinessAuthRequest, res) => {
+    try {
+      const data = await getWeeklyPostingStatus({
+        userId: req.user!.id,
+        businessId: req.businessId!,
+        planId: String(req.params.id),
+      });
+      return res.json({ success: true, data });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Could not load weekly posting.";
+      const status = /not found/i.test(message) ? 404 : 400;
+      return res.status(status).json({ success: false, message });
+    }
+  })
+);
+
+// POST /api/plans/:id/weekly-posting/enable
+router.post(
+  "/:id/weekly-posting/enable",
+  authenticateToken,
+  attachBusinessContext,
+  asyncHandler(async (req: BusinessAuthRequest, res) => {
+    const platformsRaw = Array.isArray(req.body?.platforms) ? req.body.platforms : [];
+    const platforms = platformsRaw.filter(
+      (p: unknown): p is WeeklyPlatform => p === "meta" || p === "email"
+    );
+    const hourUtc = Number(req.body?.hourUtc ?? 9);
+    const recipients = Array.isArray(req.body?.recipients)
+      ? req.body.recipients.map((r: unknown) => String(r ?? ""))
+      : [];
+    try {
+      const data = await enableWeeklyPosting({
+        userId: req.user!.id,
+        businessId: req.businessId!,
+        planId: String(req.params.id),
+        platforms,
+        hourUtc,
+        recipients,
+      });
+      return res.json({ success: true, data });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Could not enable weekly posting.";
+      return res.status(400).json({ success: false, message });
+    }
+  })
+);
+
+// POST /api/plans/:id/weekly-posting/disable
+router.post(
+  "/:id/weekly-posting/disable",
+  authenticateToken,
+  attachBusinessContext,
+  asyncHandler(async (req: BusinessAuthRequest, res) => {
+    try {
+      const data = await disableWeeklyPosting({
+        userId: req.user!.id,
+        businessId: req.businessId!,
+        planId: String(req.params.id),
+      });
+      return res.json({ success: true, data });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Could not disable weekly posting.";
+      return res.status(400).json({ success: false, message });
+    }
   })
 );
 
