@@ -531,7 +531,7 @@ router.delete(
   })
 );
 
-// GET /api/campaigns/:id/publish/preview?platform=meta|google_ads
+// GET /api/campaigns/:id/publish/preview?platform=meta|google_ads|email
 router.get(
   "/:id/publish/preview",
   authenticateToken,
@@ -541,7 +541,10 @@ router.get(
       platform: req.query.platform ?? "meta",
     });
     if (!parsed.success) {
-      return res.status(400).json({ success: false, message: "platform must be meta or google_ads" });
+      return res.status(400).json({
+        success: false,
+        message: "platform must be meta, google_ads, or email",
+      });
     }
 
     try {
@@ -550,6 +553,7 @@ router.get(
         businessId: req.businessId!,
         campaignId: paramId(req.params.id),
         platform: parsed.data.platform,
+        userEmail: req.user!.email ?? null,
       });
       return res.json({ success: true, data: { preview } });
     } catch (err) {
@@ -600,6 +604,13 @@ router.post(
     }
 
     try {
+      if (parsed.data.platform === "email" && !(parsed.data.recipients?.length)) {
+        return res.status(400).json({
+          success: false,
+          message: "recipients are required for email publish (max 50).",
+        });
+      }
+
       const result = await executePublish({
         userId: req.user!.id,
         businessId: req.businessId!,
@@ -607,6 +618,8 @@ router.post(
         platform: parsed.data.platform,
         previewToken: parsed.data.previewToken,
         idempotencyKey: parsed.data.clientRequestId,
+        userEmail: req.user!.email ?? null,
+        recipients: parsed.data.recipients,
       });
 
       await completeIdempotencyKey({

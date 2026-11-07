@@ -31,13 +31,15 @@ export const createCampaignSchema = z.object({
 });
 
 export const publishCampaignSchema = z.object({
-  platform: z.enum(["meta", "google_ads"]),
+  platform: z.enum(["meta", "google_ads", "email"]),
   previewToken: z.string().min(16).max(2048),
   clientRequestId: z.string().min(8).max(128),
+  /** Required for email publishes. Ignored for meta / google_ads. */
+  recipients: z.array(z.string().email().max(254)).max(50).optional(),
 });
 
 export const publishPreviewQuerySchema = z.object({
-  platform: z.enum(["meta", "google_ads"]).default("meta"),
+  platform: z.enum(["meta", "google_ads", "email"]).default("meta"),
 });
 
 export const updateCampaignSchema = z.object({

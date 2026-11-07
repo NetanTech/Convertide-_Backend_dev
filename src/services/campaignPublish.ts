@@ -2,10 +2,12 @@ import * as crypto from "node:crypto";
 import { supabaseAdmin } from "../config/supabase";
 import { logAccountAudit } from "./accountAudit";
 import { isDemoMode, type MetaPublishMetadata } from "./integrations";
+import { isEmailConfigured, sendEmail } from "./mailer";
 
 const META_GRAPH = "https://graph.facebook.com/v21.0";
+const EMAIL_RECIPIENT_LIMIT = 50;
 
-export type PublishPlatform = "meta" | "google_ads";
+export type PublishPlatform = "meta" | "google_ads" | "email";
 
 type CampaignCopyRow = {
   id: string;
@@ -100,9 +102,15 @@ export function verifyPreviewToken(
   return { accountProvider: parsed.accountProvider ?? null };
 }
 
-function pickCopy(campaign: CampaignCopyRow): { headlines: string[]; primaryText: string } {
+function pickCopy(
+  campaign: CampaignCopyRow,
+  platform?: PublishPlatform
+): { headlines: string[]; primaryText: string } {
   const tabs = Array.isArray(campaign.tabs) ? campaign.tabs : [];
   const preferred =
+    (platform === "email"
+      ? tabs.find((t) => /email/i.test(`${t.platform ?? ""} ${t.label ?? ""}`))
+      : null) ||
     tabs.find((t) => /meta|facebook|instagram/i.test(`${t.platform ?? ""} ${t.label ?? ""}`)) ||
     tabs[0];
   const items = Array.isArray(preferred?.items) ? preferred!.items! : [];
@@ -110,8 +118,51 @@ function pickCopy(campaign: CampaignCopyRow): { headlines: string[]; primaryText
   const texts = sorted.map((i) => (i.text || "").trim()).filter(Boolean);
   return {
     headlines: texts.slice(0, 3),
-    primaryText: texts[0] || `${campaign.name} — ready to launch.`,
+    primaryText: texts[0] || `${campaign.name} - ready to launch.`,
   };
+}
+
+export function normalizeEmailRecipients(raw: string[] | undefined | null): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const value of raw ?? []) {
+    const email = value.trim().toLowerCase();
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) continue;
+    if (seen.has(email)) continue;
+    seen.add(email);
+    out.push(email);
+    if (out.length >= EMAIL_RECIPIENT_LIMIT) break;
+  }
+  return out;
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function buildMarketingEmailHtml(input: {
+  campaignName: string;
+  headlines: string[];
+  primaryText: string;
+}): { subject: string; html: string; text: string } {
+  const subject = (input.headlines[0] || input.campaignName || "Convert Tide campaign").slice(0, 120);
+  const bodyLines = [input.primaryText, ...input.headlines.slice(1)].filter(Boolean);
+  const paragraphs = bodyLines
+    .map((line) => `<p style="margin:0 0 16px;font-size:16px;line-height:1.5;color:#0d0d0d;">${escapeHtml(line)}</p>`)
+    .join("");
+  const html = `<!DOCTYPE html><html><body style="margin:0;padding:24px;background:#f5f9eb;font-family:Arial,sans-serif;">
+  <div style="max-width:560px;margin:0 auto;background:#ffffff;border:1px solid #e7e7e7;border-radius:12px;padding:24px;">
+    <p style="margin:0 0 8px;font-size:12px;letter-spacing:0.04em;text-transform:uppercase;color:#718a29;">Convert Tide</p>
+    <h1 style="margin:0 0 20px;font-size:22px;line-height:1.3;color:#0d0d0d;">${escapeHtml(input.campaignName)}</h1>
+    ${paragraphs}
+  </div>
+</body></html>`;
+  const text = [`${input.campaignName}`, "", ...bodyLines].join("\n");
+  return { subject, html, text };
 }
 
 async function resolveMetaAccount(userId: string): Promise<IntegrationTokenRow | null> {
@@ -150,11 +201,57 @@ export async function buildPublishPreview(input: {
   businessId: string;
   campaignId: string;
   platform: PublishPlatform;
+  userEmail?: string | null;
 }): Promise<PublishPreview> {
   const campaign = await loadCampaign(input.userId, input.businessId, input.campaignId);
-  const copy = pickCopy(campaign);
+  const copy = pickCopy(campaign, input.platform);
   const connectPath = "/dashboard/settings?tab=integrations";
   const exp = Date.now() + 15 * 60 * 1000;
+
+  if (input.platform === "email") {
+    const accountEmail = (input.userEmail || "").trim().toLowerCase();
+    const zeptoReady = isEmailConfigured();
+    if (!zeptoReady || !accountEmail) {
+      return {
+        platform: "email",
+        authorized: false,
+        accountProvider: null,
+        accountName: null,
+        connectPath: "/dashboard/settings",
+        campaignId: campaign.id,
+        campaignName: campaign.name,
+        headlines: copy.headlines,
+        primaryText: copy.primaryText,
+        previewToken: "",
+        previewExpiresAt: new Date(exp).toISOString(),
+        mode: "unauthorized",
+      };
+    }
+
+    const previewToken = signPreviewToken({
+      userId: input.userId,
+      businessId: input.businessId,
+      campaignId: input.campaignId,
+      platform: "email",
+      accountProvider: "email",
+      exp,
+    });
+
+    return {
+      platform: "email",
+      authorized: true,
+      accountProvider: "email",
+      accountName: accountEmail,
+      connectPath: "/dashboard/settings",
+      campaignId: campaign.id,
+      campaignName: campaign.name,
+      headlines: copy.headlines,
+      primaryText: copy.primaryText,
+      previewToken,
+      previewExpiresAt: new Date(exp).toISOString(),
+      mode: "live",
+    };
+  }
 
   if (input.platform === "meta") {
     const account = await resolveMetaAccount(input.userId);
@@ -375,6 +472,8 @@ export async function executePublish(input: {
   platform: PublishPlatform;
   previewToken: string;
   idempotencyKey: string;
+  userEmail?: string | null;
+  recipients?: string[];
 }): Promise<{
   publish: {
     id: string;
@@ -399,14 +498,31 @@ export async function executePublish(input: {
     businessId: input.businessId,
     campaignId: input.campaignId,
     platform: input.platform,
+    userEmail: input.userEmail,
   });
 
   if (!preview.authorized || !preview.previewToken) {
     throw new Error(
       input.platform === "meta"
         ? "Connect a Facebook or Instagram account before publishing."
-        : "Google Ads publishing requires demo mode or a connected Google Ads account."
+        : input.platform === "email"
+          ? "Email publishing needs ZeptoMail configured and an account email."
+          : "Google Ads publishing requires demo mode or a connected Google Ads account."
     );
+  }
+
+  const emailRecipients =
+    input.platform === "email"
+      ? normalizeEmailRecipients(
+          input.recipients?.length
+            ? input.recipients
+            : preview.accountName
+              ? [preview.accountName]
+              : []
+        )
+      : [];
+  if (input.platform === "email" && emailRecipients.length === 0) {
+    throw new Error("Add at least one valid recipient email before publishing.");
   }
 
   // Re-sign isn't needed — user must pass the token from the preview they confirmed.
@@ -441,7 +557,8 @@ export async function executePublish(input: {
           accountName: row.account_name,
           externalId: row.external_id,
           publishedAt: row.published_at,
-          reversible: Boolean(row.external_id) && row.status === "published",
+          reversible:
+            row.platform !== "email" && Boolean(row.external_id) && row.status === "published",
         },
         replayed: true,
       };
@@ -512,6 +629,37 @@ export async function executePublish(input: {
       } else {
         throw new Error("Connect a Facebook Page or Instagram Professional account before publishing.");
       }
+    } else if (input.platform === "email") {
+      const mail = buildMarketingEmailHtml({
+        campaignName: preview.campaignName,
+        headlines: preview.headlines,
+        primaryText: preview.primaryText,
+      });
+      const failed: string[] = [];
+      let sent = 0;
+      for (const to of emailRecipients) {
+        const result = await sendEmail({
+          to,
+          subject: mail.subject,
+          html: mail.html,
+          text: mail.text,
+        });
+        if (result.ok) sent += 1;
+        else failed.push(to);
+      }
+      if (sent === 0) {
+        throw new Error(
+          failed.length
+            ? `Email send failed for ${failed.join(", ")}. Check ZeptoMail and try again.`
+            : "Email send failed. Check ZeptoMail and try again."
+        );
+      }
+      externalId = `email_zepto_${crypto.randomUUID()}`;
+      mode = "live";
+      preview.accountName =
+        emailRecipients.length === 1
+          ? emailRecipients[0]
+          : `${sent} recipients${failed.length ? ` (${failed.length} failed)` : ""}`;
     } else {
       externalId = `google_ads_demo_${crypto.randomUUID()}`;
       mode = "demo";
@@ -525,10 +673,12 @@ export async function executePublish(input: {
         external_id: externalId,
         published_at: publishedAt,
         updated_at: publishedAt,
+        account_name: preview.accountName,
         preview: {
           headlines: preview.headlines,
           primaryText: preview.primaryText,
           mode,
+          ...(input.platform === "email" ? { recipients: emailRecipients } : {}),
         },
       })
       .eq("id", publishId)
@@ -558,6 +708,7 @@ export async function executePublish(input: {
         externalId,
         mode,
         accountName: preview.accountName,
+        ...(input.platform === "email" ? { recipients: emailRecipients } : {}),
       },
     });
 
@@ -578,7 +729,7 @@ export async function executePublish(input: {
         accountName: row.account_name,
         externalId: row.external_id,
         publishedAt: row.published_at,
-        reversible: Boolean(row.external_id),
+        reversible: input.platform === "email" ? false : Boolean(row.external_id),
       },
     };
   } catch (err) {
@@ -725,7 +876,8 @@ export async function listPublishes(input: {
       revokedAt: r.revoked_at,
       createdAt: r.created_at,
       errorMessage: r.error_message,
-      reversible: r.status === "published" && Boolean(r.external_id),
+      reversible:
+        r.platform !== "email" && r.status === "published" && Boolean(r.external_id),
     };
   });
 }
