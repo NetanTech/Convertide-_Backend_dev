@@ -700,7 +700,12 @@ router.get(
   authenticateToken,
   asyncHandler(async (req: AuthRequest, res) => {
     const onboardingCompleted = req.user?.id ? await getOnboardingCompleted(req.user.id) : false;
-    return res.json({ success: true, data: { user: req.user, onboardingCompleted } });
+    const { isAdminEmail } = await import("../services/admin");
+    const isAdmin = await isAdminEmail(req.user?.email);
+    return res.json({
+      success: true,
+      data: { user: req.user, onboardingCompleted, isAdmin },
+    });
   })
 );
 

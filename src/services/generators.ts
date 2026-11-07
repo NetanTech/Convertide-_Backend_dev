@@ -288,29 +288,183 @@ export async function buildCampaignPayload(
   };
 }
 
+/** Mon–Sun copy deliverables. Copy only, never video generation. */
+export const PLAN_CONTENT_DAY_POOLS: Record<string, string[]> = {
+  instagram: [
+    "Feed captions",
+    "Headline tests",
+    "CTA variants",
+    "Carousel copy",
+    "Story captions",
+    "Engagement replies",
+    "Weekend captions",
+  ],
+  facebook: [
+    "Post copy",
+    "Ad headlines",
+    "Long-form posts",
+    "CTA tests",
+    "Offer copy",
+    "Comment prompts",
+    "Weekend posts",
+  ],
+  email: [
+    "Subject lines",
+    "Preview text",
+    "Body copy",
+    "CTA buttons",
+    "Nurture email",
+    "Offer email",
+    "Weekend digest",
+  ],
+  tiktok: [
+    "Hooks",
+    "Caption variants",
+    "CTA lines",
+    "Script hooks",
+    "Trend captions",
+    "Reply prompts",
+    "Weekend hooks",
+  ],
+  linkedin: [
+    "Post copy",
+    "Hooks",
+    "Headline tests",
+    "CTA lines",
+    "Thought leadership",
+    "Comment prompts",
+    "Weekend posts",
+  ],
+  google: [
+    "Ad headlines",
+    "Descriptions",
+    "CTA lines",
+    "Offer copy",
+    "Angle tests",
+    "Keyword copy",
+    "Weekend ads",
+  ],
+  other: [
+    "Export copy",
+    "Headline pack",
+    "CTA pack",
+    "Short copy",
+    "Long copy",
+    "Angle tests",
+    "Weekend export",
+  ],
+};
+
+const VIDEO_LIKE_FORMAT = /\b(reel|reels|video|videos|short|shorts)\b/i;
+
+function seedFrom(text: string): number {
+  let hash = 0;
+  for (let i = 0; i < text.length; i += 1) {
+    hash = (hash * 31 + text.charCodeAt(i)) >>> 0;
+  }
+  return hash;
+}
+
+function rotateDays(pool: string[], offset: number): string[] {
+  const n = pool.length;
+  if (n === 0) return Array.from({ length: 7 }, () => "Copy");
+  const start = ((offset % n) + n) % n;
+  return Array.from({ length: 7 }, (_, i) => pool[(start + i) % n]!);
+}
+
+export function buildContentCalendarDays(platform: string, seed = ""): string[] {
+  const key = platform.toLowerCase();
+  const pool = PLAN_CONTENT_DAY_POOLS[key] ?? PLAN_CONTENT_DAY_POOLS.other;
+  return rotateDays(pool, seedFrom(`${key}:${seed}`));
+}
+
+export function normalizeContentCalendarItem(
+  item: {
+    platform?: string;
+    label?: string;
+    format?: string;
+    days?: string[];
+  },
+  seed = ""
+) {
+  const platform = String(item.platform ?? "other");
+  const key = platform.toLowerCase();
+  const pool = PLAN_CONTENT_DAY_POOLS[key] ?? PLAN_CONTENT_DAY_POOLS.other;
+  const fallbackDay = pool[0] ?? "Copy";
+  const existingDays = Array.isArray(item.days)
+    ? item.days.map((d) => String(d ?? "").trim()).filter(Boolean)
+    : [];
+  const legacy = String(item.format ?? "").trim();
+  const legacyIsBad =
+    !legacy || VIDEO_LIKE_FORMAT.test(legacy) || /^newsletter$/i.test(legacy) || /^posts?$/i.test(legacy);
+
+  let days: string[];
+  if (existingDays.length >= 7) {
+    days = existingDays.slice(0, 7);
+  } else if (existingDays.length > 0) {
+    days = [...existingDays, ...buildContentCalendarDays(platform, seed).slice(existingDays.length)].slice(
+      0,
+      7
+    );
+  } else if (legacyIsBad) {
+    days = buildContentCalendarDays(platform, seed);
+  } else {
+    days = rotateDays(
+      Array.from(new Set([legacy, ...buildContentCalendarDays(platform, seed)])),
+      seedFrom(`${key}:${seed}:${legacy}`)
+    );
+  }
+
+  days = days.map((day) =>
+    VIDEO_LIKE_FORMAT.test(day) || /^newsletter$/i.test(day) || /^posts?$/i.test(day) ? fallbackDay : day
+  );
+
+  return {
+    platform: item.platform ?? "other",
+    label: item.label ?? platform,
+    format: days[0] ?? fallbackDay,
+    days,
+  };
+}
+
+export function normalizeContentCalendar(
+  items: unknown,
+  seed = ""
+): Array<{ platform: string; label: string; format: string; days: string[] }> {
+  if (!Array.isArray(items)) return [];
+  return items.map((raw) =>
+    normalizeContentCalendarItem(
+      raw && typeof raw === "object"
+        ? (raw as { platform?: string; label?: string; format?: string; days?: string[] })
+        : {},
+      seed
+    )
+  );
+}
+
 function weekTasks(tone: ToneKey, length: string): string[] {
   const base: Record<ToneKey, string[]> = {
-    default: ["Market research", "Audience analysis", "Brand messaging", "Step up tracking", "Creative drafts", "Channel tests"],
+    default: ["Market research", "Audience analysis", "Brand messaging", "Step up tracking", "Copy drafts", "Channel tests"],
     professional: [
       "Stakeholder brief",
       "Audience analysis",
       "Message architecture",
       "Measurement plan",
-      "Creative review",
+      "Copy review",
       "Performance readout",
     ],
     friendly: [
       "Listen to your audience",
       "Map their day-to-day",
       "Draft warm messaging",
-      "Share early concepts",
+      "Share early copy concepts",
       "Light channel tests",
       "Celebrate quick wins",
     ],
     bold: [
       "Competitive teardown",
       "Sharpen the offer",
-      "High-impact creatives",
+      "High-impact copy",
       "Aggressive test plan",
       "Push winning ads",
       "Double down on lifts",
@@ -328,7 +482,7 @@ function weekTasks(tone: ToneKey, length: string): string[] {
       "Curate audience signals",
       "Craft elevated narratives",
       "Selective channel mix",
-      "Polish hero assets",
+      "Polish hero copy",
       "Measure brand lift",
     ],
   };
@@ -361,11 +515,14 @@ export async function buildPlanPayload(input: {
   const fmt = (d: Date) =>
     d.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
 
-  let weekly = Array.from({ length: weekCount }, (_, i) => ({
-    week: i + 1,
-    days: "Days 1–7",
-    tasks: [...tasks],
-  }));
+  let weekly = Array.from({ length: weekCount }, (_, i) => {
+    const rotated = [...tasks.slice(i % tasks.length), ...tasks.slice(0, i % tasks.length)];
+    return {
+      week: i + 1,
+      days: "Days 1–7",
+      tasks: rotated,
+    };
+  });
 
   const language = input.aiPrefs?.preferredLanguage ?? "";
   if (language.trim() && !/^english$/i.test(language.trim())) {
@@ -412,11 +569,32 @@ export async function buildPlanPayload(input: {
       { platform: "other", label: "Others", percent: 10 },
     ],
     weekly_action_plan: weekly,
+    // Varied Mon–Sun copy deliverables (not video). Seeded so plans differ by brand.
     content_calendar: [
-      { platform: "instagram", label: "Instagram", format: "Reels" },
-      { platform: "facebook", label: "Facebook", format: "Posts" },
-      { platform: "email", label: "Email marketing", format: "Newsletter" },
-      { platform: "tiktok", label: "Tiktok", format: "Videos" },
+      {
+        platform: "instagram",
+        label: "Instagram",
+        format: "Feed captions",
+        days: buildContentCalendarDays("instagram", brand),
+      },
+      {
+        platform: "facebook",
+        label: "Facebook",
+        format: "Post copy",
+        days: buildContentCalendarDays("facebook", brand),
+      },
+      {
+        platform: "email",
+        label: "Email marketing",
+        format: "Subject lines",
+        days: buildContentCalendarDays("email", brand),
+      },
+      {
+        platform: "tiktok",
+        label: "Tiktok",
+        format: "Hooks",
+        days: buildContentCalendarDays("tiktok", brand),
+      },
     ],
     kpis: [
       { label: "Website Traffic", value: "+30%", delta: "+14.2%", positive: true },
